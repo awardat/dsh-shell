@@ -1,0 +1,10 @@
+node_modules/
+ui/dist/
+src-tauri/target/
+src-tauri/gen/
+.tools/
+release/
+*.log
+deepseek-harness-master/
+.npmrc
+.env

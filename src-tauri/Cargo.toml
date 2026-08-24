@@ -1,0 +1,39 @@
+[package]
+name = "dsh-ui"
+version = "0.1.25"
+description = "DeepSeek Harness desktop shell: embedded cmd terminal + webview wrapper"
+authors = ["dsh-ui"]
+edition = "2021"
+
+[lib]
+name = "dsh_ui_lib"
+# 仅桌面端：不需要 cdylib（其导出 Windows 序号符号会触发 GNU ld 的
+# "export ordinal too large" 链接错误），rlib 直接静态链接进主程序。
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = "0.8"
+webview2-com = "0.38.2"
+windows-core = "0.61"
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

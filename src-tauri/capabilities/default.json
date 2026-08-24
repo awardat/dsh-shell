@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口的默认权限；remote 为本机 DSH 服务的 iframe 页面预留（当前未使用）",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+  },
+  "permissions": [
+    "core:default",
+    "core:webview:allow-set-webview-zoom",
+    "opener:default",
+    "dialog:default"
+  ]
+}

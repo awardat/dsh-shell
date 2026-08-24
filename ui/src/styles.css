@@ -1,0 +1,416 @@
+:root {
+  --bg: #0d1117;
+  --bg-2: #161b22;
+  --bg-3: #1c2129;
+  --fg: #c9d1d9;
+  --fg-dim: #8b949e;
+  --accent: #4f8cff;
+  --ok: #3fb950;
+  --err: #f85149;
+  --boot: #d29922;
+  --border: #30363d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* hidden 属性必须优先于任何 display 声明（如 .panel 的 display:flex），
+   否则元素 hidden 后仍会显示 */
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+  overflow: hidden;
+  user-select: none;
+}
+
+/* ---------- 主窗口 shell ---------- */
+.shell-body {
+  background: var(--bg);
+}
+
+.app-frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: #fff;
+}
+
+/* ---------- 启动遮罩 ---------- */
+.boot-mask {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: radial-gradient(1200px 600px at 50% -10%, #1f2a44 0%, var(--bg) 60%);
+}
+
+.splash-logo {
+  width: 72px;
+  height: 72px;
+  border-radius: 16px;
+  object-fit: cover;
+  box-shadow: 0 8px 30px rgba(79, 140, 255, 0.35);
+}
+
+.splash-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.splash-status {
+  color: var(--fg-dim);
+  font-size: 13px;
+  min-height: 18px;
+}
+
+.spinner {
+  width: 26px;
+  height: 26px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+  margin-top: 4px;
+}
+
+/* 启动遮罩上的只读 console（boot/failed/stopped 阶段） */
+.boot-terminal {
+  width: min(680px, 86vw);
+  height: 240px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--bg);
+  padding: 4px 2px;
+  text-align: left;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.error-box {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  max-width: 560px;
+  text-align: center;
+}
+
+.error-text {
+  color: var(--err);
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.error-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.btn {
+  padding: 7px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-2);
+  color: var(--fg);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn:hover {
+  background: var(--bg-3);
+}
+
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+/* ---------- 右下角固定终端按钮 ---------- */
+.float-btn {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 13px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(22, 27, 34, 0.97);
+  color: var(--fg);
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+
+.float-btn:hover {
+  background: var(--bg-3);
+}
+
+.float-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--boot);
+}
+
+.float-dot.ok {
+  background: var(--ok);
+  box-shadow: 0 0 8px rgba(63, 185, 80, 0.8);
+}
+
+.float-dot.err {
+  background: var(--err);
+  box-shadow: 0 0 8px rgba(248, 81, 73, 0.8);
+}
+
+.float-dot.stop {
+  background: var(--fg-dim);
+}
+
+/* ---------- 终端面板（底部呼出） ---------- */
+.panel {
+  position: fixed;
+  left: 16px;
+  right: 16px;
+  bottom: 66px;
+  z-index: 9;
+  height: 55%;
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
+  background: rgba(13, 17, 23, 0.98);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+}
+
+.panel-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.panel-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-dim);
+}
+
+.state-chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+}
+
+.state-chip.ok {
+  color: var(--ok);
+  border-color: rgba(63, 185, 80, 0.4);
+}
+
+.state-chip.err {
+  color: var(--err);
+  border-color: rgba(248, 81, 73, 0.4);
+}
+
+.state-chip.boot {
+  color: var(--boot);
+  border-color: rgba(210, 153, 34, 0.4);
+}
+
+.state-chip.stop {
+  color: var(--fg-dim);
+  border-color: rgba(139, 148, 158, 0.4);
+}
+
+.toolbar-spacer {
+  flex: 1;
+}
+
+.tool-btn {
+  min-width: 26px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-3);
+  color: var(--fg);
+  font-size: 13px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.tool-btn:hover {
+  background: #2a3039;
+}
+
+.zoom-label {
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  min-width: 52px;
+}
+
+.terminal {
+  flex: 1;
+  padding: 4px 6px;
+  overflow: hidden;
+}
+
+.panel-log {
+  max-height: 90px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  background: var(--bg-2);
+  user-select: text;
+}
+
+.log-line {
+  line-height: 1.5;
+}
+
+/* ---------- 设置弹窗 ---------- */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.modal-card {
+  width: 420px;
+  max-width: 92vw;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  user-select: text;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+
+.modal-body {
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+.field input[type="text"],
+.field input[type="number"] {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 13px;
+  font-family: Consolas, monospace;
+}
+
+.field.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  color: var(--fg);
+}
+
+.field-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.field-group-title {
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+.row {
+  display: flex;
+  gap: 6px;
+}
+
+.row input {
+  flex: 1;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}
+
+/* 设置保存提示 */
+.save-tip {
+  position: absolute;
+  bottom: 56px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  border-radius: 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--ok);
+  font-size: 12px;
+  white-space: nowrap;
+  z-index: 21;
+}
