@@ -27,7 +27,9 @@ pub fn apply(app: &AppHandle, factor: f64) -> Result<f64, String> {
         g.zoom = factor;
         g.settings.zoom = factor;
         let dir = g.config_dir.clone();
-        g.settings.save(&dir);
+        if let Err(e) = g.settings.save(&dir) {
+            eprintln!("[dsh-ui] {e}");
+        }
     }
     server::emit_state(app, &app.state::<Arc<Mutex<AppInner>>>());
     Ok(factor)

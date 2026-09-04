@@ -117,8 +117,19 @@ function applyState(p: { phase: string; message?: string; url: string; zoom: num
     bootMask.hidden = true;
     floatBtn.hidden = false;
     browserBtn.hidden = false;
-    // 首次就绪加载 DSH UI；URL 变化（如改端口后重启）时重新加载 iframe
-    if (!loaded || frame.src !== p.url) {
+    // 首次就绪加载 DSH UI；URL 变化（如改端口后重启）时重新加载 iframe。
+    // frame.src 可能带认证重载的缓存破拆参数（?_=…），按去参后的主 URL 比较
+    const norm = (u: string) => {
+      try {
+        const x = new URL(u);
+        x.search = "";
+        x.hash = "";
+        return x.href;
+      } catch {
+        return u;
+      }
+    };
+    if (!loaded || norm(frame.src) !== norm(p.url)) {
       loaded = true;
       frame.src = p.url;
     }

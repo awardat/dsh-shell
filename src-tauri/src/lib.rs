@@ -1,3 +1,4 @@
+mod auth;
 mod commands;
 mod download;
 mod job;

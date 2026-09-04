@@ -40,6 +40,10 @@ pub struct AppInner {
     pub ready_timeout: u64,
     /// 本次启动是否处于"首次运行需下载 dsh"场景（用于提示与超时文案）
     pub needs_download: bool,
+    /// 新版 dsh（≥0.1.2-rc.1）：终端已捕获到带 token 的 URL（认证交换待完成）
+    pub auth_pending: bool,
+    /// 新版 dsh：认证 cookie 已注入 WebView2（iframe 可直接加载）
+    pub auth_done: bool,
 }
 
 /// 终端输出缓冲上限（字节）
@@ -82,6 +86,8 @@ impl AppInner {
             probe_stop: Arc::new(AtomicBool::new(false)),
             ready_timeout,
             needs_download: false,
+            auth_pending: false,
+            auth_done: false,
         }
     }
 }
@@ -234,7 +240,11 @@ fn find_last_workspace() -> Option<PathBuf> {
 
 // ---------- HTTP 探测 ----------
 
-fn http_ok(port: u16) -> bool {
+/// HTTP 层探测：服务是否已响应。
+/// dsh ≥ 0.1.2-rc.1 引入浏览器 token 认证后，无 token/cookie 的 `GET /` 返回 401
+/// （认证门存在 = 服务已就绪，UI 由带 token 的 URL 完成换 cookie 流程）；
+/// 旧版返回 200。因此 200 / 303 / 401 均视为"HTTP 服务活着"。
+fn http_responsive(port: u16) -> bool {
     let addr = format!("127.0.0.1:{port}");
     let Ok(mut sock) = TcpStream::connect_timeout(
         &addr.parse().unwrap_or_else(|_| "127.0.0.1:1".parse().unwrap()),
@@ -257,9 +267,37 @@ fn http_ok(port: u16) -> bool {
                 || head.starts_with("HTTP/1.0 200")
                 || head.starts_with("HTTP/1.1 30")
                 || head.starts_with("HTTP/1.0 30")
+                // dsh ≥ 0.1.2-rc.1：无 token/cookie 的根请求返回 401（认证门）
+                || head.starts_with("HTTP/1.1 401")
+                || head.starts_with("HTTP/1.0 401")
         }
         Err(_) => false,
     }
+}
+
+/// 从终端输出提取 dsh 打印的 Web URL（`dsh web: http://127.0.0.1:3080/?token=…`）。
+/// dsh ≥ 0.1.2-rc.1 打印带 launch token 的 URL，iframe 用它首访换取认证 cookie；
+/// 只认 loopback（127.0.0.1 / localhost），忽略 ` (LAN: …)` 等尾巴。
+fn extract_dsh_web_url(text: &str) -> Option<String> {
+    let needle = "dsh web:";
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(needle) {
+        let start = from + rel + needle.len();
+        let rest = text[start..].trim_start();
+        let Some(rest) = rest.strip_prefix("http://") else {
+            from = start;
+            continue;
+        };
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == ')' || c == '(')
+            .unwrap_or(rest.len());
+        let authority = &rest[..end];
+        if authority.starts_with("127.0.0.1:") || authority.starts_with("localhost:") {
+            return Some(format!("http://{authority}"));
+        }
+        from = start;
+    }
+    None
 }
 
 // ---------- dsh 可用性检测 ----------
@@ -657,6 +695,8 @@ fn start_session(app: &AppHandle, inner: &Arc<Mutex<AppInner>>, feed: bool) {
         let mut g = inner.lock().unwrap();
         g.probe_stop.store(false, Ordering::Relaxed);
         g.term_buffer.clear();
+        g.auth_pending = false;
+        g.auth_done = false;
         g.term = Some(session);
     }
     if let Some(t) = inner.lock().unwrap().term.as_mut() {
@@ -673,6 +713,7 @@ fn start_session(app: &AppHandle, inner: &Arc<Mutex<AppInner>>, feed: bool) {
         let mut recent = String::new();
         let mut failed_once = false;
         let mut download_seen = false;
+        let mut auth_exchange_started = false;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
@@ -684,6 +725,53 @@ fn start_session(app: &AppHandle, inner: &Arc<Mutex<AppInner>>, feed: bool) {
                         let mut g = inner2.lock().unwrap();
                         g.term_buffer.push_str(&text);
                         truncate_term_buffer(&mut g.term_buffer);
+                    }
+                    // dsh web 打印行：新版（≥0.1.2-rc.1）带 launch token，
+                    // Rust 侧换取签名 cookie 后注入 WebView2（iframe 跨站无法自持 Strict cookie）；
+                    // probe 会等待 auth_done 之后才广播 ready，确保 iframe 首载即带 cookie
+                    if !failed_once && !auth_exchange_started {
+                        if let Some(web_url) = extract_dsh_web_url(&text) {
+                            if web_url.contains("token=") {
+                                auth_exchange_started = true;
+                                {
+                                    let mut g = inner2.lock().unwrap();
+                                    g.auth_pending = true;
+                                }
+                                let app3 = app2.clone();
+                                let gen_auth = gen;
+                                std::thread::spawn(move || {
+                                    let Some((cname, cvalue, domain)) =
+                                        crate::auth::exchange_cookie(&web_url)
+                                    else {
+                                        eprintln!("[dsh-ui] cookie exchange failed: {web_url}");
+                                        return;
+                                    };
+                                    eprintln!(
+                                        "[dsh-ui] cookie exchanged, injecting (domain={domain})"
+                                    );
+                                    if let Some(win) = app3.get_webview_window("main") {
+                                        let app4 = app3.clone();
+                                        let done = std::sync::Arc::new(move |ok: bool| {
+                                            if ok {
+                                                {
+                                                    let state =
+                                                        app4.state::<Arc<Mutex<AppInner>>>();
+                                                    let mut g = state.lock().unwrap();
+                                                    // 代次校验：仅当本代会话仍有效时置位
+                                                    if g.gen == gen_auth {
+                                                        g.auth_done = true;
+                                                    }
+                                                }
+                                                eprintln!("[dsh-ui] auth cookie injected");
+                                            } else {
+                                                eprintln!("[dsh-ui] auth cookie injection failed");
+                                            }
+                                        });
+                                        crate::auth::inject(&win, cname, cvalue, domain, done);
+                                    }
+                                });
+                            }
+                        }
                     }
                     if failed_once {
                         continue;
@@ -746,9 +834,23 @@ fn start_probe(app: AppHandle, inner: Arc<Mutex<AppInner>>) {
             if stop.load(Ordering::Relaxed) || stale {
                 return;
             }
-            if http_ok(port) {
+            if http_responsive(port) {
                 if inner.lock().unwrap().gen != gen {
                     return;
+                }
+                // 新版 dsh（≥0.1.2-rc.1）认证：捕获到 token 后等待 cookie 注入完成，
+                // 确保 iframe 首载即带 cookie（等待上限 8s，避免注入失败拖死启动）
+                let auth_ok = {
+                    let g = inner.lock().unwrap();
+                    !g.auth_pending || g.auth_done
+                };
+                if !auth_ok {
+                    if Instant::now() >= started + Duration::from_secs(timeout.min(8)) {
+                        eprintln!("[dsh-ui] auth cookie wait timed out, proceeding");
+                    } else {
+                        std::thread::sleep(Duration::from_millis(300));
+                        continue;
+                    }
                 }
                 eprintln!("[dsh-ui] ready (probe ok)");
                 inner.lock().unwrap().restart_count = 0;
@@ -1044,6 +1146,40 @@ mod tests {
         // 保留的是后半段
         let t = trim_window("abcdefgh", 4);
         assert_eq!(t, "efgh");
+    }
+
+    #[test]
+    fn extracts_dsh_web_url_with_token() {
+        // 0.1.2-rc.1 起的带 token 打印行（含 LAN 尾巴）→ 取 loopback token URL
+        let line = "dsh web: http://127.0.0.1:3080/?token=KDEY0TIaKfL0nJ88 (LAN: http://192.168.1.5:3080/?token=XYZ)";
+        assert_eq!(
+            extract_dsh_web_url(line).as_deref(),
+            Some("http://127.0.0.1:3080/?token=KDEY0TIaKfL0nJ88")
+        );
+    }
+
+    #[test]
+    fn extracts_dsh_web_url_legacy_clean() {
+        // 旧版（rc.8 及更早）干净 URL 行
+        assert_eq!(
+            extract_dsh_web_url("dsh web: http://127.0.0.1:3080/").as_deref(),
+            Some("http://127.0.0.1:3080/")
+        );
+    }
+
+    #[test]
+    fn ignores_non_loopback_and_noise() {
+        // 纯 LAN 行不命中（无 loopback URL 前缀文本）
+        assert_eq!(extract_dsh_web_url("dsh web: http://192.168.1.5:3080/"), None);
+        // 无关输出
+        assert_eq!(extract_dsh_web_url("C:\\Users\\x>npx --yes dsh web"), None);
+        assert_eq!(extract_dsh_web_url(""), None);
+        // 多行输出中命中 loopback
+        let multi = "some output\r\ndsh web: http://127.0.0.1:3999/?token=T1\r\nnext line";
+        assert_eq!(
+            extract_dsh_web_url(multi).as_deref(),
+            Some("http://127.0.0.1:3999/?token=T1")
+        );
     }
 
     #[test]

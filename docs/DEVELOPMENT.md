@@ -61,17 +61,28 @@ npm run build
 - 安装包复制到 `<项目根>\release\`（**所有历史版本保留，不清理**，同名版本覆盖）；
 - 脚本自动配置 GNU 工具链 PATH 与代理（未设置时默认 `http://127.0.0.1:10808`）。
 
-> **版本号约定**：每次功能改动，版本号**第三段 +1**，前两段保持不变（当前 0.1.25，
-> 由 0.1.0 累计 25 次改动而来）。同步修改三处：
+> **版本号约定**：每次功能改动，版本号**第三段 +1**，前两段保持不变（当前 0.1.26，
+> 由 0.1.0 累计 26 次改动而来）。同步修改三处：
 > `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`package.json`。
 > 安装包命名 `dsh_shell_<版本>_<架构>-setup.exe`（由 `productName: "dsh_shell"` 驱动）。
 > 每次发版同步更新 `README.md` 的「更新记录」章节（与版本一一对应）。
 
 > **默认启动命令（0.1.22 起）**：`pnpm dlx @deepseek-ai/dsh@next web --no-open`——pnpm 替代 npx
-> （`npm i -g pnpm`）；`@next` 是 npm dist-tag（当前 0.1.0-rc.8，最新预发布线）；
+> （`npm i -g pnpm`）；`@next` 是 npm dist-tag（当前 0.1.2-rc.1，最新预发布线）；
 > `--no-open` 阻止新版 dsh（rc.7+）自动打开默认浏览器（见
 > `packages/bundle/web-app/src/startup.ts` 的 web flag 家族；rc.6 及更早不支持该参数）。
 > pnpm 10+ 默认禁止依赖 postinstall 脚本，需 `pnpm config set dangerouslyAllowAllBuilds true`。
+
+> **浏览器 token 认证（dsh ≥ 0.1.2-rc.1，0.1.26 适配）**：每进程随机 launch token，
+> `dsh web: http://127.0.0.1:<port>/?token=…` 打印行由读取线程捕获（`extract_dsh_web_url`）。
+> dsh 的认证 cookie 为 `SameSite=Strict`，壳 iframe（顶层 `tauri.localhost`）属跨站、无法自持该
+> cookie → `auth.rs` 在 Rust 侧发 HTTP 请求完成 token 交换（`GET /?token=…` → 303 + Set-Cookie，
+> 同 `packages/client/connection/src/browser-auth.ts` 的 `authorizeIndex` 语义），再经
+> WebView2 `CookieManager` 注入 **SameSite=None + Secure + HttpOnly + 持久（30 天）** 的等价 cookie
+> （None 使跨站 iframe 请求可携带；WebView2 默认允许第三方 cookie；127.0.0.1 为 trustworthy origin）。
+> `probe` 就绪判定（`http_responsive` 接受 200/30x/401——401 即认证门存在）会**等待注入完成
+> （auth_done，上限 8s）后再广播 Ready**，确保 iframe 首载即带 cookie。签名 secret 持久于凭据、
+> cookie 不绑定进程 token → dsh 重启/壳重启后 cookie 仍有效。旧版 dsh 无此机制，行为不变。
 
 NSIS 使用自定义模板 `src-tauri\nsis\installer.nsi`（基于 tauri 2.11.4 官方模板改造）：
 
