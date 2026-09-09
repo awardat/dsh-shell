@@ -62,6 +62,7 @@ pub fn run() {
 
             // 主窗口：shell 页面（iframe 内嵌 DSH UI + 右下角终端按钮/面板）
             let nav_handle = app_handle.clone();
+            let nav_inner = inner.clone();
             let mut main_builder = WebviewWindowBuilder::new(
                 app,
                 "main",
@@ -72,23 +73,34 @@ pub fn run() {
             .min_inner_size(720.0, 540.0)
             // 窗口底色与启动画面一致（深色）：页面首帧渲染前不显示白屏
             .background_color(tauri::window::Color(13, 17, 23, 255));
-            if std::env::var("DSH_DEBUG_DEVTOOLS").is_ok() {
+            // 调试：DSH_DEBUG_DEVTOOLS 值为 1/true 才启用（release 误继承环境变量不再裸奔）
+            let dbg = std::env::var("DSH_DEBUG_DEVTOOLS").unwrap_or_default();
+            let debug_enabled = dbg == "1" || dbg.eq_ignore_ascii_case("true");
+            if debug_enabled {
                 // WebView2 环境参数以首个 webview 为准
                 main_builder = main_builder.additional_browser_args("--remote-debugging-port=9222");
             }
             let main = main_builder
             .on_navigation(move |url| {
-                let host = url.host_str().unwrap_or("").to_string();
-                let scheme = url.scheme().to_string();
-                // 放行：Tauri 本地资产协议（tauri://、http://tauri.localhost）、
-                // 本机 DSH 服务；其余（外链）交给系统浏览器。
-                // data:/about: 为 WebView 内部导航兜底（低风险，保留）
-                let local = scheme == "tauri"
-                    || scheme == "data"
-                    || scheme == "about"
-                    || host == "tauri.localhost"
-                    || (scheme == "http" && (host == "127.0.0.1" || host == "localhost"));
-                if local {
+                let scheme = url.scheme();
+                // 安全收窄：只放行 Tauri 本地资产与「配置端口」的本机 DSH 服务；
+                // 不泛放行任意端口的 loopback、data:/about:（防加载内容把顶层导航
+                // 到任意本地服务/内嵌文档）。仅保留 about:blank（WebView 内部兜底）。
+                // 其余（外链/未授权本地端口）交给系统浏览器。
+                if scheme == "tauri"
+                    || (scheme == "http" && url.host_str() == Some("tauri.localhost"))
+                    || url.as_str() == "about:blank"
+                {
+                    return true;
+                }
+                let dsh_port = {
+                    let g = nav_inner.lock().unwrap();
+                    g.settings.port
+                };
+                let is_loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost"));
+                let is_dsh_service =
+                    scheme == "http" && is_loopback && url.port() == Some(dsh_port);
+                if is_dsh_service {
                     return true;
                 }
                 let _ = tauri_plugin_opener::OpenerExt::opener(&nav_handle)
@@ -97,8 +109,8 @@ pub fn run() {
             })
             .build()?;
 
-            // 调试：DSH_DEBUG_DEVTOOLS=1 时打开 DevTools（供协议检查）
-            if std::env::var("DSH_DEBUG_DEVTOOLS").is_ok() {
+            // 调试：DSH_DEBUG_DEVTOOLS 值为 1/true 时打开 DevTools（供协议检查）
+            if debug_enabled {
                 let _ = main.open_devtools();
             }
 

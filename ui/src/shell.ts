@@ -45,7 +45,9 @@ const fit = new FitAddon();
 term.loadAddon(fit);
 term.open(document.getElementById("terminal")!);
 
-term.onData((data) => void cmd.terminalInput(data));
+term.onData((data) => {
+  cmd.terminalInput(data).catch((e) => console.error("终端输入失败:", e));
+});
 term.onResize(({ cols, rows }) => void cmd.terminalResize(cols, rows));
 
 const terminalEl = document.getElementById("terminal")!;
@@ -76,7 +78,9 @@ const bootFit = new FitAddon();
 bootTerm.loadAddon(bootFit);
 bootTerm.open(document.getElementById("boot-terminal")!);
 // 与面板终端同一条输入链路（terminal_input → ConPTY 会话）
-bootTerm.onData((data) => void cmd.terminalInput(data));
+bootTerm.onData((data) => {
+  cmd.terminalInput(data).catch((e) => console.error("终端输入失败:", e));
+});
 
 const bootTermEl = document.getElementById("boot-terminal")!;
 const roBoot = new ResizeObserver(() => {
@@ -102,6 +106,17 @@ function fitBootTerm() {
 // ---------- 状态 ----------
 let url = "http://127.0.0.1:3080/";
 let loaded = false;
+// 启动 watchdog：轮询 getState 连续失败（IPC 层不可用）时给出可操作错误
+let ipcFailures = 0;
+const IPC_FAIL_LIMIT = 3;
+
+function showIpcError() {
+  spinner.hidden = true;
+  errorBox.hidden = false;
+  browserBtn.hidden = true;
+  phaseText.textContent = "界面通信失败";
+  errorText.textContent = "无法与主进程通信。请关闭窗口后重新打开应用。";
+}
 
 function applyState(p: { phase: string; message?: string; url: string; zoom: number }) {
   url = p.url;
@@ -110,13 +125,17 @@ function applyState(p: { phase: string; message?: string; url: string; zoom: num
   floatDot.classList.remove("ok", "err", "boot", "stop");
   stateChip.classList.remove("ok", "err", "boot", "stop");
 
+  // 统一复位（幂等：任意相邻状态切换都不残留前一个 phase 的元素状态）
+  errorBox.hidden = true;
+  spinner.hidden = true;
+  browserBtn.hidden = true;
+
   if (p.phase === "ready") {
     floatDot.classList.add("ok");
     stateChip.textContent = "运行中";
     stateChip.classList.add("ok");
     bootMask.hidden = true;
     floatBtn.hidden = false;
-    browserBtn.hidden = false;
     // 首次就绪加载 DSH UI；URL 变化（如改端口后重启）时重新加载 iframe。
     // frame.src 可能带认证重载的缓存破拆参数（?_=…），按去参后的主 URL 比较
     const norm = (u: string) => {
@@ -140,7 +159,7 @@ function applyState(p: { phase: string; message?: string; url: string; zoom: num
     bootMask.hidden = false;
     floatBtn.hidden = false;
     errorBox.hidden = false;
-    spinner.hidden = true;
+    browserBtn.hidden = false; // failed 状态下可"在浏览器中打开"排查
     phaseText.textContent = "启动失败";
     errorText.textContent = p.message || "";
     fitBootTerm();
@@ -151,8 +170,6 @@ function applyState(p: { phase: string; message?: string; url: string; zoom: num
     bootMask.hidden = false;
     floatBtn.hidden = false;
     errorBox.hidden = false;
-    spinner.hidden = true;
-    browserBtn.hidden = true;
     phaseText.textContent = "服务已停止";
     errorText.textContent = p.message || "服务已手动停止";
     fitBootTerm();
@@ -160,7 +177,8 @@ function applyState(p: { phase: string; message?: string; url: string; zoom: num
     floatDot.classList.add("boot");
     stateChip.textContent = "启动中";
     stateChip.classList.add("boot");
-    errorBox.hidden = true;
+    bootMask.hidden = false;
+    floatBtn.hidden = false;
     spinner.hidden = false;
     phaseText.textContent = p.message || "正在启动服务…";
     fitBootTerm();
@@ -169,9 +187,15 @@ function applyState(p: { phase: string; message?: string; url: string; zoom: num
 
 async function refreshState() {
   try {
+    ipcFailures = 0;
     applyState(await cmd.getState());
   } catch (e) {
+    ipcFailures += 1;
     console.error("读取状态失败:", e);
+    // IPC 连续失败：模块/桥接损坏时给出可操作错误而非无限 spinner
+    if (ipcFailures >= IPC_FAIL_LIMIT && bootMask.hidden === false) {
+      showIpcError();
+    }
   }
 }
 
@@ -181,9 +205,19 @@ void refreshState();
 setInterval(refreshState, 2000);
 
 // ---------- 终端输出 ----------
-// 先补发历史缓冲（启动早期事件可能在订阅前丢失），再订阅实时输出；
-// 面板终端与启动遮罩只读终端同步写入
+// 面板终端与启动遮罩终端同步写入。先订阅实时输出到 pending 缓冲，
+// 再补发历史快照，最后按序 flush——快照与订阅之间的输出不丢失（防竞态）
 void (async () => {
+  const pending: string[] = [];
+  let live = false;
+  void onTerminalData((p) => {
+    if (live) {
+      term.write(p.data);
+      bootTerm.write(p.data);
+    } else {
+      pending.push(p.data);
+    }
+  });
   try {
     const snap = await cmd.getTerminalBuffer();
     if (snap) {
@@ -193,10 +227,12 @@ void (async () => {
   } catch (e) {
     console.error("读取终端缓冲失败:", e);
   }
-  void onTerminalData((p) => {
-    term.write(p.data);
-    bootTerm.write(p.data);
-  });
+  for (const d of pending) {
+    term.write(d);
+    bootTerm.write(d);
+  }
+  pending.length = 0;
+  live = true;
 })();
 
 function log(msg: string) {
@@ -299,6 +335,10 @@ cfgSysProxy.addEventListener("change", () => {
   cfgProxy.disabled = cfgSysProxy.checked;
 });
 
+// 打开设置时记录当前设置：保存时只合并弹窗内编辑的字段，
+// zoom / autoStart / terminalHeightRatio 等未暴露字段沿用磁盘值（后端亦保留）
+let lastSettings: Settings | null = null;
+
 document.getElementById("btn-settings")!.addEventListener("click", async () => {
   let s: Settings;
   try {
@@ -307,6 +347,7 @@ document.getElementById("btn-settings")!.addEventListener("click", async () => {
     console.error("读取设置失败:", e);
     s = { ...DEFAULT_SETTINGS };
   }
+  lastSettings = s;
   cfgCommand.value = s.startupCommand;
   cfgWorkdir.value = s.workingDir;
   cfgPort.value = String(s.port);
@@ -344,18 +385,21 @@ function showSaveTip(text: string) {
 }
 
 document.getElementById("btn-save-settings")!.addEventListener("click", async () => {
+  const base = lastSettings ?? { ...DEFAULT_SETTINGS };
+  // 仅覆盖弹窗编辑的字段；数值整数化（step=1 之外再防 3080.5 / 1e2 类输入）
+  const clampInt = (v: number, min: number, max: number, fb: number) =>
+    Math.trunc(Math.max(min, Math.min(max, Number.isFinite(v) ? v : fb)));
   const s: Settings = {
+    ...base,
     startupCommand: cfgCommand.value.trim() || DEFAULT_SETTINGS.startupCommand,
     workingDir: cfgWorkdir.value.trim(),
-    port: Math.max(1, Math.min(65535, Number(cfgPort.value) || 3080)),
-    readyTimeoutSec: Math.max(10, Math.min(600, Number(cfgTimeout.value) || 120)),
-    zoom: 1.0,
-    autoStart: true,
+    port: clampInt(Number(cfgPort.value), 1, 65535, 3080),
+    readyTimeoutSec: clampInt(Number(cfgTimeout.value), 10, 600, 120),
     keepAliveOnExit: cfgKeepalive.checked,
     autoRestart: cfgAutorestart.checked,
-    terminalHeightRatio: DEFAULT_SETTINGS.terminalHeightRatio,
     useSystemProxy: cfgSysProxy.checked,
-    proxyUrl: cfgProxy.value.trim(),
+    // 系统代理开启时代理地址字段不生效，沿用磁盘值（保留手动模式备用地址）
+    proxyUrl: cfgSysProxy.checked ? base.proxyUrl : cfgProxy.value.trim(),
   };
   try {
     await cmd.saveSettings(s);
@@ -363,7 +407,7 @@ document.getElementById("btn-save-settings")!.addEventListener("click", async ()
     showSaveTip("设置已保存，重启服务后生效");
   } catch (e) {
     console.error("保存设置失败:", e);
-    showSaveTip("保存失败，请重试");
+    showSaveTip(`保存失败：${String(e)}`);
   }
 });
 

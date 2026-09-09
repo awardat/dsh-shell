@@ -123,6 +123,8 @@ body {
   font-size: 13px;
   white-space: pre-wrap;
   word-break: break-all;
+  /* 错误信息需要可复制（排查/反馈），不随全局 user-select:none */
+  user-select: text;
 }
 
 .error-actions {

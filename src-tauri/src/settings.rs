@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+/// 串行化设置写盘：唯一临时文件 + 互斥，避免并发保存撕裂配置
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -39,27 +45,74 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// 语义归一化：把非法但可表示的值收敛到合理默认（磁盘/IPC 边界兜底）。
+    pub fn normalize(mut self) -> Self {
+        if self.port == 0 {
+            eprintln!("[dsh-ui] settings: invalid port 0, reset to 3080");
+            self.port = 3080;
+        }
+        if !self.zoom.is_finite() {
+            eprintln!("[dsh-ui] settings: invalid zoom, reset to 1.0");
+            self.zoom = 1.0;
+        } else {
+            self.zoom = self.zoom.clamp(0.5, 3.0);
+        }
+        if !(self.terminal_height_ratio > 0.0) || self.terminal_height_ratio > 1.0 {
+            eprintln!("[dsh-ui] settings: invalid terminal_height_ratio, reset to 0.55");
+            self.terminal_height_ratio = 0.55;
+        }
+        if self.ready_timeout_sec == 0 {
+            eprintln!("[dsh-ui] settings: invalid ready_timeout_sec 0, reset to 120");
+            self.ready_timeout_sec = 120;
+        }
+        self
+    }
+
     pub fn load(dir: &PathBuf) -> Self {
         let path = dir.join("settings.json");
-        match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-            Err(_) => Settings::default(),
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => return Settings::default(), // 文件不存在 → 默认
+        };
+        match serde_json::from_str::<Settings>(&text) {
+            Ok(s) => s.normalize(),
+            Err(e) => {
+                // 文件存在但损坏：备份原文件后回退默认，避免后续 save 覆盖丢失原配置
+                eprintln!("[dsh-ui] settings.json parse failed: {e}; backing up original");
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let bak = dir.join(format!("settings.json.bak-{ts}"));
+                if fs::copy(&path, &bak).is_ok() {
+                    eprintln!("[dsh-ui] original preserved at {}", bak.display());
+                }
+                Settings::default()
+            }
         }
     }
 
     pub fn save(&self, dir: &PathBuf) -> Result<(), String> {
-        let path = dir.join("settings.json");
-        let text = serde_json::to_string_pretty(self).map_err(|e| format!("序列化设置失败：{e}"))?;
-        // 先写临时文件再替换，避免写坏配置
-        let tmp = dir.join("settings.json.tmp");
-        fs::write(&tmp, text).map_err(|e| format!("写入设置失败：{e}"))?;
-        if let Err(e) = fs::rename(&tmp, &path) {
-            // 替换失败：清理临时文件并报告，不静默
-            let _ = fs::remove_file(&tmp);
-            return Err(format!("保存设置失败：{e}"));
-        }
-        Ok(())
+        let text =
+            serde_json::to_string_pretty(self).map_err(|e| format!("序列化设置失败：{e}"))?;
+        write_settings(dir, &text)
     }
+}
+
+/// 原子写盘（唯一临时文件 + 串行化；锁外调用：不持有 AppInner 状态锁）
+pub fn write_settings(dir: &PathBuf, text: &str) -> Result<(), String> {
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = dir.join("settings.json");
+    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let tmp = dir.join(format!("settings.json.tmp-{pid}-{seq}"));
+    fs::write(&tmp, text).map_err(|e| format!("写入设置失败：{e}"))?;
+    if let Err(e) = fs::rename(&tmp, &path) {
+        // 替换失败：清理临时文件并报告，不静默
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("保存设置失败：{e}"));
+    }
+    Ok(())
 }
 
 /// IPC 层使用的设置结构：字段名 camelCase，与前端 TS 接口一致。

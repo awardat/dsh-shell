@@ -16,7 +16,7 @@
       <h1 class="splash-title">DeepSeek Harness</h1>
       <div id="phase-text" class="splash-status">正在启动…</div>
       <div class="spinner" id="spinner"></div>
-      <!-- 启动阶段只读 console 输出（就绪后随遮罩隐藏） -->
+      <!-- 启动阶段 console 输出（可输入，就绪后随遮罩隐藏） -->
       <div id="boot-terminal" class="boot-terminal"></div>
       <div id="error-box" class="error-box" hidden>
         <div id="error-text" class="error-text"></div>
@@ -72,16 +72,16 @@
           </label>
           <label class="field">
             <span>端口</span>
-            <input id="cfg-port" type="number" min="1" max="65535" />
+            <input id="cfg-port" type="number" min="1" max="65535" step="1" />
           </label>
           <label class="field">
             <span>就绪超时（秒，首次运行下载自动放宽到 30 分钟）</span>
-            <input id="cfg-timeout" type="number" min="10" max="600" />
+            <input id="cfg-timeout" type="number" min="10" max="600" step="1" />
           </label>
           <div class="field-group">
             <span class="field-group-title">代理（下载 DeepSeek Harness 时）</span>
             <label class="field check">
-              <input id="cfg-sysproxy" type="checkbox" checked />
+              <input id="cfg-sysproxy" type="checkbox" />
               <span>使用系统代理设置</span>
             </label>
             <label class="field">

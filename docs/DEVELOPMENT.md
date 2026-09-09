@@ -61,8 +61,8 @@ npm run build
 - 安装包复制到 `<项目根>\release\`（**所有历史版本保留，不清理**，同名版本覆盖）；
 - 脚本自动配置 GNU 工具链 PATH 与代理（未设置时默认 `http://127.0.0.1:10808`）。
 
-> **版本号约定**：每次功能改动，版本号**第三段 +1**，前两段保持不变（当前 0.1.26，
-> 由 0.1.0 累计 26 次改动而来）。同步修改三处：
+> **版本号约定**：每次功能改动，版本号**第三段 +1**，前两段保持不变（当前 0.1.27，
+> 由 0.1.0 累计 27 次改动而来）。同步修改三处：
 > `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`package.json`。
 > 安装包命名 `dsh_shell_<版本>_<架构>-setup.exe`（由 `productName: "dsh_shell"` 驱动）。
 > 每次发版同步更新 `README.md` 的「更新记录」章节（与版本一一对应）。
@@ -159,6 +159,14 @@ iframe 内快捷键不可注入——跨域限制，缩放按钮不受影响）�
 - **`std::env::set_var/remove_var` 多线程调用**（`server.rs::apply_proxy_env`）：进程全局
   环境变量非同步；edition 2021 下合法可编译（Rust 2024 起为 unsafe）。仅在启动会话/退出
   keep-alive 前调用一次，风险低，属已知 footgun。
+- **windows crate 两代并存**：直接依赖 `windows-core 0.61`/`windows-sys 0.59`，而 tauri/wry
+  栈解析到 `windows-core 0.62`/`windows-sys 0.60+`（`webview2-com 0.38` 锁定 0.61 代）。
+  当前两代类型无交叉（job.rs 用裸 HANDLE、webview2-com 自持 COM 层）可编译；
+  一旦代码需要向 tauri/wry API 传递本 crate 代的窗口/内核类型将出现不透明类型不匹配。
+  **跟踪**：随 `webview2-com` 升级（连带 windows 代）一并解决。
+- **JobObject attach 窗口**（`terminal.rs`）：portable-pty 在 spawn 之后才允许 attach，
+  spawn→attach 窗口内 cmd 自行派生的进程（如 AutoRun）不在作业内、退出时可能残留；
+  attach 失败已记录日志。此为 portable-pty API 限制，无 pre-spawn 挂起改造路径。
 
 ## 架构速览
 

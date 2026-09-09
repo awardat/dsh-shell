@@ -60,9 +60,11 @@ impl Drop for JobObject {
     }
 }
 
-// HANDLE 是内核句柄值（64 位指针宽整数），本身可跨线程传递；
-// 该 JobObject 具有单一所有权：仅 Drop 中关闭一次，无内部可变状态，
-// 无并发访问路径（进程树清理只在退出/重启时发生），因此 Send/Sync 安全。
-// 若未来为此结构增加字段（如内部缓冲区），需重新评估该 unsafe impl。
+// `Sync` 与公开 `&self` 方法（assign）并存时，并发跨线程使用是允许的（如 Arc<JobObject>），
+// 其安全性依赖三条不变式：
+// 1) 原始 HANDLE 从不复制，CloseHandle 恰好执行一次（仅 Drop）；
+// 2) Drop 由 Rust 所有权保证不与任何存活的 &self 借用竞争；
+// 3) 对同一作业句柄的并发内核调用（OpenProcess / AssignProcessToJobObject）线程安全。
+// 若未来添加非 Sync 字段或任何 &self 可变状态，必须重新评估本 impl。
 unsafe impl Send for JobObject {}
 unsafe impl Sync for JobObject {}

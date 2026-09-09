@@ -25,7 +25,7 @@ export interface Settings {
   proxyUrl: string;
 }
 
-export const DEFAULT_SETTINGS: Settings = {
+export const DEFAULT_SETTINGS: Readonly<Settings> = {
   startupCommand: "pnpm dlx @deepseek-ai/dsh@next web --no-open",
   workingDir: "",
   port: 3080,
@@ -56,12 +56,8 @@ export const cmd = {
 };
 
 // ---------- 事件订阅（listen 常驻回调，返回取消函数） ----------
-export interface StateChangedPayload {
-  phase: Phase;
-  message?: string;
-  url: string;
-  zoom: number;
-}
+/** state:changed 载荷与 AppState 同构（后端同一份 JSON），复用单一类型防漂移 */
+export type StateChangedPayload = AppState;
 
 export interface TerminalDataPayload {
   data: string;

@@ -1,8 +1,10 @@
 [package]
 name = "dsh-ui"
-version = "0.1.26"
+version = "0.1.27"
 description = "DeepSeek Harness desktop shell: embedded cmd terminal + webview wrapper"
 authors = ["dsh-ui"]
+license-file = "../LICENSE"
+repository = "https://github.com/awardat/dsh-shell"
 edition = "2021"
 
 [lib]

@@ -156,6 +156,10 @@ fn decode_project_key(key: &str) -> Vec<PathBuf> {
         String::new()
     };
     let rest = if drive.is_empty() { &parts[..] } else { &parts[1..] };
+    if rest.is_empty() {
+        // 盘符根 workspace（编码形如 --C--）：直接返回根目录候选（调用方做存在性验证）
+        return vec![PathBuf::from(if drive.is_empty() { "C:\\" } else { drive.as_str() })];
+    }
     let mut out = Vec::new();
     // 枚举合并组合：n 段之间 n-1 个可分/合点，限制组合数避免爆炸
     let n = rest.len();
@@ -605,12 +609,14 @@ pub fn boot(app: &AppHandle, inner: &Arc<Mutex<AppInner>>) {
         // 仍提供终端会话（不喂启动命令），供查看/排查
         start_session(app, inner, false);
         if let Some(t) = inner.lock().unwrap().term.as_mut() {
-            t.write(
+            if let Err(e) = t.write(
                 format!(
                     "echo [dsh-ui] 端口 {port} 已有服务监听，已直接连接；若页面显示异常，可能是非 DSH 服务占用该端口\r"
                 )
                 .as_bytes(),
-            );
+            ) {
+                eprintln!("[dsh-ui] write to session failed: {e}");
+            }
         }
         set_phase(app, inner, Phase::Ready, None);
         start_keepalive(app, inner.clone());
@@ -700,7 +706,9 @@ fn start_session(app: &AppHandle, inner: &Arc<Mutex<AppInner>>, feed: bool) {
         g.term = Some(session);
     }
     if let Some(t) = inner.lock().unwrap().term.as_mut() {
-        t.write(feed_str.as_bytes());
+        if let Err(e) = t.write(feed_str.as_bytes()) {
+            eprintln!("[dsh-ui] feed to session failed: {e}");
+        }
     }
 
     // 读取线程：ConPTY 输出 → 前端；同时扫描失败特征
@@ -743,7 +751,14 @@ fn start_session(app: &AppHandle, inner: &Arc<Mutex<AppInner>>, feed: bool) {
                                     let Some((cname, cvalue, domain)) =
                                         crate::auth::exchange_cookie(&web_url)
                                     else {
-                                        eprintln!("[dsh-ui] cookie exchange failed: {web_url}");
+                                        // 不打印完整 URL：query 中的 token 是凭据
+                                        let host = web_url
+                                            .strip_prefix("http://")
+                                            .and_then(|r| r.split_once('/').map(|(a, _)| a))
+                                            .unwrap_or("?");
+                                        eprintln!(
+                                            "[dsh-ui] cookie exchange failed for http://{host}"
+                                        );
                                         return;
                                     };
                                     eprintln!(
@@ -838,22 +853,38 @@ fn start_probe(app: AppHandle, inner: Arc<Mutex<AppInner>>) {
                 if inner.lock().unwrap().gen != gen {
                     return;
                 }
-                // 新版 dsh（≥0.1.2-rc.1）认证：捕获到 token 后等待 cookie 注入完成，
-                // 确保 iframe 首载即带 cookie（等待上限 8s，避免注入失败拖死启动）
-                let auth_ok = {
+                // 认证处理（dsh ≥ 0.1.2-rc.1）：
+                // HTTP 首见就绪可能早于 reader 解析到 token 打印行——此时 auth_pending
+                // 尚未置位，与"旧版无需认证"不可区分。首次 HTTP 就绪后进入短暂 grace，
+                // 期间若 reader 置位 auth_pending 则转入 cookie 等待；grace 过后仍未置位
+                // 视为旧版（无认证），直接就绪。
+                let (auth_pending, auth_done) = {
                     let g = inner.lock().unwrap();
-                    !g.auth_pending || g.auth_done
+                    (g.auth_pending, g.auth_done)
                 };
-                if !auth_ok {
-                    if Instant::now() >= started + Duration::from_secs(timeout.min(8)) {
-                        eprintln!("[dsh-ui] auth cookie wait timed out, proceeding");
-                    } else {
+                if !auth_pending && !auth_done {
+                    if started.elapsed() < Duration::from_millis(2500) {
+                        // grace：给 reader 时间解析 dsh web 打印行
                         std::thread::sleep(Duration::from_millis(300));
                         continue;
                     }
+                } else if auth_pending && !auth_done {
+                    // 已捕获 token：等待注入完成（上限 8s，避免注入失败拖死启动）
+                    if started.elapsed() < Duration::from_secs(timeout.min(8)) {
+                        std::thread::sleep(Duration::from_millis(300));
+                        continue;
+                    }
+                    eprintln!("[dsh-ui] auth cookie wait timed out, proceeding");
+                }
+                // 单锁复查代次与停止标志后提交 Ready（避免过期探针污染新代）
+                {
+                    let mut g = inner.lock().unwrap();
+                    if g.gen != gen || g.probe_stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    g.restart_count = 0;
                 }
                 eprintln!("[dsh-ui] ready (probe ok)");
-                inner.lock().unwrap().restart_count = 0;
                 set_phase(&app, &inner, Phase::Ready, None);
                 start_keepalive(&app, inner);
                 return;
@@ -1021,7 +1052,32 @@ pub fn handle_close(app: &AppHandle) {
     }
     // 询问：保持运行（默认）还是同时结束后台服务
     if ask_keep_alive(app) {
-        // 用户选择「保持运行」：脱离作业，另起一个独立 cmd 会话
+        // 用户选择「保持运行」
+        let state = app.state::<Arc<Mutex<AppInner>>>();
+        let port = { state.lock().unwrap().settings.port };
+        // 1) 先停当前会话树（服务若在客户端树内 → 释放端口，避免 detached 撞 EADDRINUSE）
+        {
+            let mut g = state.lock().unwrap();
+            g.probe_stop.store(true, Ordering::Relaxed);
+            g.gen += 1;
+            if let Some(mut term) = g.term.take() {
+                term.kill();
+                // JobObject 句柄随 term drop 关闭 → 整树终止
+            }
+        }
+        // 2) 等待端口释放（最多 ~5s）
+        let release_deadline = Instant::now() + Duration::from_secs(5);
+        while port_listening(port) && Instant::now() < release_deadline {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // 3) 端口仍被监听（既有 detached/外部服务存活）→ 直接保持，不再重复启动
+        if port_listening(port) {
+            eprintln!(
+                "[dsh-ui] keep-alive: port {port} already served by a surviving process; skip relaunch"
+            );
+            return;
+        }
+        // 4) 端口已释放：脱离作业，另起一个独立 cmd 会话
         let (cmdline, log_path) = {
             let state = app.state::<Arc<Mutex<AppInner>>>();
             let g = state.lock().unwrap();
@@ -1110,6 +1166,15 @@ mod tests {
         assert!(decode_project_key("--root--").is_empty());
         assert!(decode_project_key("--_no-cwd--").is_empty());
         assert!(decode_project_key("--a-b-c--").len() >= 2);
+    }
+
+    #[test]
+    fn decode_project_key_drive_root_does_not_panic() {
+        // 盘符根 workspace（--C--）：返回根候选，不得越界 panic
+        let candidates = decode_project_key("--C--");
+        assert_eq!(candidates, vec![PathBuf::from("C:\\")]);
+        // 单段非盘符（如 --tmp--）：不 panic 且给出候选
+        assert!(decode_project_key("--code--").len() >= 1);
     }
 
     #[test]

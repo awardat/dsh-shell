@@ -18,7 +18,8 @@ use webview2_com::{
 };
 use windows_core::{Interface, PWSTR};
 
-/// 默认下载目录：%USERPROFILE%\Downloads（不存在则退回用户主目录）
+/// 默认下载目录：%USERPROFILE%\Downloads（不存在则退回用户主目录；
+/// 连主目录都拿不到时用系统临时目录——盘符根对标准用户不可写）
 fn download_dir() -> PathBuf {
     if let Ok(home) = std::env::var("USERPROFILE") {
         let dl = PathBuf::from(&home).join("Downloads");
@@ -27,7 +28,7 @@ fn download_dir() -> PathBuf {
         }
         return PathBuf::from(home);
     }
-    PathBuf::from("C:\\")
+    std::env::temp_dir()
 }
 
 fn pwstr_to_string(pw: PWSTR) -> String {
@@ -89,8 +90,20 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Windows 保留设备名（大小写不敏感；含扩展名仍保留，如 CON.zip）
+fn is_reserved_device_name(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5"
+            | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4"
+            | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    )
+}
+
 /// 清洗下载文件名：拒绝空 / `.` / `..` / 含盘符的值；含路径分隔符（`/` `\`）时
-/// 取最后一段（剥离绝对路径与穿越目录），仍非法则返回 None（调用方走下一级兜底）。
+/// 取最后一段（剥离绝对路径与穿越目录）；再过滤 Windows 非法字符
+/// （`< > " | ? *`、控制字符 0x00–0x1F、尾部点/空格）与保留设备名；
+/// 仍非法则返回 None（调用方走下一级兜底）。
 fn sanitize_filename(name: &str) -> Option<String> {
     let name = name.trim();
     if name.is_empty() || name == "." || name == ".." {
@@ -98,6 +111,23 @@ fn sanitize_filename(name: &str) -> Option<String> {
     }
     let seg = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
     if seg.is_empty() || seg == "." || seg == ".." || seg.contains(':') {
+        return None;
+    }
+    // 尾部点/空格（Windows 不允许）
+    let seg = seg.trim_end_matches(['.', ' ']);
+    if seg.is_empty() {
+        return None;
+    }
+    // 非法字符与控制字符
+    if seg
+        .chars()
+        .any(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*') || (c as u32) < 0x20)
+    {
+        return None;
+    }
+    // 保留设备名（含扩展名也保留：按主干判断）
+    let stem = seg.split('.').next().unwrap_or(&seg);
+    if is_reserved_device_name(stem) {
         return None;
     }
     Some(seg.to_string())
@@ -153,6 +183,8 @@ pub fn setup(app: &AppHandle, main: &WebviewWindow) {
         };
 
         // 自动允许"下载多个文件"权限（否则 WebView2 弹 edge://permission-request-dialog）
+        // 安全收窄：仅放行来自本机服务（loopback）或应用自身资产的下载请求，
+        // 其余来源保持默认行为（拒绝）
         if let Ok(wv8) = core.cast::<ICoreWebView2_8>() {
             let handle_perm = app.clone();
             let perm_handler = PermissionRequestedEventHandler::create(Box::new(move |_, args| {
@@ -165,13 +197,30 @@ pub fn setup(app: &AppHandle, main: &WebviewWindow) {
                 );
                 let _ = unsafe { args.PermissionKind(&mut kind) };
                 if kind == COREWEBVIEW2_PERMISSION_KIND_MULTIPLE_AUTOMATIC_DOWNLOADS {
-                    let _ = unsafe { args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW) };
+                    // 校验请求来源：取请求 Uri 的 host（仅 http/https）
+                    let mut uri_pw = PWSTR::null();
+                    let _ = unsafe { args.Uri(&mut uri_pw) };
+                    let uri = pwstr_to_string(uri_pw);
+                    let host = uri
+                        .strip_prefix("http://")
+                        .or_else(|| uri.strip_prefix("https://"))
+                        .and_then(|r| r.split('/').next())
+                        .and_then(|a| a.split(':').next());
+                    let trusted =
+                        matches!(host, Some("127.0.0.1" | "localhost" | "tauri.localhost"));
+                    if trusted {
+                        let _ = unsafe { args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW) };
+                    } else {
+                        eprintln!("[dsh-ui] download permission denied for origin: {uri}");
+                    }
                 }
                 let _ = handle_perm;
                 Ok(())
             }));
             let mut token: i64 = 0;
-            let _ = unsafe { wv8.add_PermissionRequested(&perm_handler, &mut token) };
+            if unsafe { wv8.add_PermissionRequested(&perm_handler, &mut token) }.is_err() {
+                eprintln!("[dsh-ui] download: add_PermissionRequested failed");
+            }
         }
 
         // 下载起始：确定文件名/路径、挂完成通知、放行
@@ -212,12 +261,27 @@ pub fn setup(app: &AppHandle, main: &WebviewWindow) {
                 Ok(())
             }));
             let mut token: i64 = 0;
-            let _ = unsafe { operation.add_StateChanged(&state_changed, &mut token) };
+            if unsafe { operation.add_StateChanged(&state_changed, &mut token) }.is_err() {
+                eprintln!("[dsh-ui] download: add_StateChanged failed");
+            }
 
-            // 设置保存路径并放行
+            // 设置保存路径并放行；失败也发完成事件（ok:false），避免"点击无反应"
             let hstr = windows_core::HSTRING::from(path.to_string_lossy().to_string());
-            unsafe { args.SetResultFilePath(&hstr) }?;
-            unsafe { args.SetHandled(true) }?;
+            let set_path_ok = unsafe { args.SetResultFilePath(&hstr) }.is_ok();
+            let handled_ok = unsafe { args.SetHandled(true) }.is_ok();
+            if !set_path_ok || !handled_ok {
+                eprintln!(
+                    "[dsh-ui] download: set result path/handled failed (path_ok={set_path_ok}, handled_ok={handled_ok})"
+                );
+                let _ = handle.emit(
+                    "download:completed",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "ok": false,
+                    }),
+                );
+                return Ok(());
+            }
             let _ = handle.emit(
                 "download:starting",
                 serde_json::json!({ "path": path.to_string_lossy(), "name": name }),
@@ -225,8 +289,11 @@ pub fn setup(app: &AppHandle, main: &WebviewWindow) {
             Ok(())
         }));
         let mut token: i64 = 0;
-        let _ = unsafe { wv4.add_DownloadStarting(&handler, &mut token) };
-        eprintln!("[dsh-ui] download handler installed");
+        if unsafe { wv4.add_DownloadStarting(&handler, &mut token) }.is_err() {
+            eprintln!("[dsh-ui] download: add_DownloadStarting failed");
+        } else {
+            eprintln!("[dsh-ui] download handler installed");
+        }
     });
 }
 
@@ -290,5 +357,25 @@ mod tests {
         assert_eq!(sanitize_filename(""), None);
         assert_eq!(sanitize_filename("C:"), None);
         assert_eq!(sanitize_filename("a:b.zip"), None);
+    }
+
+    #[test]
+    fn sanitize_filename_rejects_windows_invalid_names() {
+        // 非法字符 / 控制字符 / 尾点空格（修剪为合法名）
+        assert_eq!(sanitize_filename("report?.zip"), None);
+        assert_eq!(sanitize_filename("a<b>c.zip"), None);
+        assert_eq!(sanitize_filename("evil."), Some("evil".into()));
+        assert_eq!(sanitize_filename("name with trailing "), Some("name with trailing".into()));
+        assert_eq!(sanitize_filename("bad\u{1f}.zip"), None);
+        assert_eq!(sanitize_filename("..."), None); // 全为点 → 修剪后为空
+        // 保留设备名（含扩展名）
+        assert_eq!(sanitize_filename("CON"), None);
+        assert_eq!(sanitize_filename("con.zip"), None);
+        assert_eq!(sanitize_filename("NUL"), None);
+        assert_eq!(sanitize_filename("COM1.txt"), None);
+        assert_eq!(sanitize_filename("LPT9"), None);
+        // 合法名不受影响
+        assert_eq!(sanitize_filename("console.log.txt").as_deref(), Some("console.log.txt"));
+        assert_eq!(sanitize_filename("report.final.zip").as_deref(), Some("report.final.zip"));
     }
 }

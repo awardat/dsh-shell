@@ -1,0 +1,812 @@
+─── ui/src/styles.css:20-22 ───
+[maintainability · low] All overlay layers (.boot-mask, .panel, .modal, .save-tip) are shown/hidden
+solely via the `hidden` attribute, so their visibility depends entirely on this `[hidden]` rule with
+`!important` surviving any later/competing `display` declarations (note `[hidden]` and the class
+selectors here have equal specificity, so without the `!important` the later `.panel`/`.modal` rules
+would win). If future CSS ever sets `display` with `!important` on these classes or toggles them via
+inline styles instead of the attribute, an overlay can get stuck over the UI. Keep this rule as the
+single source of truth for overlay visibility and avoid competing `display: ... !important`
+declarations elsewhere.
+
+
+
+─── ui/index.html:11-11 ───
+[security · medium] The backend-reported service URL is used without a loopback allow-list check in
+at least two places: in shell.ts it is assigned directly to the shell iframe (`frame.src = p.url`,
+which also lacks a `sandbox` attribute), and the `btn-open-browser` handler forwards the same
+last-reported `url` to `cmd.openBrowser`. A tampered, malformed, stale, or off-loopback URL could
+therefore load an untrusted page with top-level window privileges or open the OS browser at an
+arbitrary address. Validate the URL as http(s) against a loopback/localhost allow-list before it is
+stored/used, add a least-privilege `sandbox` to the iframe, and re-check the URL before calling
+`openBrowser`.
+
+
+
+─── ui/index.html:25-25 ───
+[bug · medium] This button is declared `hidden` and shell.ts only ever reveals it in the `ready`
+branch (the `stopped` branch re-hides it, and the `failed` branch never touches its visibility).
+Consequently, if the very first launch fails before any `ready` event, or the service is stopped and
+then fails to restart, the error box is shown but "在浏览器中打开" stays permanently hidden — retry becomes
+the only actionable choice. Drive this button's visibility from the phase state machine (reveal it
+in the `failed` state) instead of leaving it default-hidden.
+
+
+
+─── ui/index.html:84-84 ───
+[bug · medium] The markup hard-codes "使用系统代理" as checked while leaving the manual proxy URL field
+enabled — the exact opposite of the runtime rule (`cfgProxy.disabled = cfgSysProxy.checked`). Worse,
+the save path persists whatever text sits in the proxy field regardless of which checkbox is active,
+so a stale/typo'd URL can silently be stored and take effect later when the checkbox is turned off.
+Initialize these controls from persisted settings instead of hard-coding `checked`, disable the URL
+input in markup to match, and validate the proxy URL (http/https scheme, resolvable host) before
+saving.
+
+- <input id="cfg-sysproxy" type="checkbox" checked />
++ <input id="cfg-sysproxy" type="checkbox" />
+
+
+─── ui/index.html:75-75 ───
+[bug · low] HTML min/max alone don't stop fractional or exponent input (e.g. `3080.5`, `1e2`), and
+the shell clamps but does not round to an integer before persisting. A value like `3080.5` for
+`cfg-port` can reach the backend and corrupt URL building / u16 parsing. Add `step="1"` here and
+enforce integer parsing (parseInt/Math.trunc plus range check) on the save path; `cfg-timeout` has
+the same issue.
+
+- <input id="cfg-port" type="number" min="1" max="65535" />
++ <input id="cfg-port" type="number" min="1" max="65535" step="1" />
+
+
+─── ui/index.html:108-108 ───
+[maintainability · low] If this module fails to load or the IPC layer never answers (no
+ready/failed/stopped event), the boot mask and spinner stay up indefinitely and the window is
+unusable with no visible clue — there is no `<noscript>`, `onerror`, or startup watchdog in the
+markup. Consider a short timeout that flips the boot overlay to the error box with a retry/reload
+path when no state event arrives, so a broken bundle degrades to an actionable error instead of an
+eternal spinner.
+
+
+
+─── ui/tsconfig.json:7-7 ───
+[bug · high] `include` covers `vite.config.ts`, but `types` limits the auto-included @types packages
+to `vite/client` only. The config file uses `__dirname` and `import { resolve } from "node:path"`,
+which are declared by `@types/node`. Since `node` is not listed, @types/node is excluded from this
+compilation and `tsc` will fail on `vite.config.ts` with errors such as 'Cannot find name __dirname'
+/ 'Cannot find module node:path'. Consider the standard Vite split: a `tsconfig.app.json` for `src`
+(DOM + vite/client) and a `tsconfig.node.json` (types: ["node"]) that includes `vite.config.ts`, or
+explicitly add "node" to `types`.
+
+
+
+─── ui/tsconfig.json:11-12 ───
+[maintainability · medium] Vite transpiles each TS file independently with esbuild, so tsc should
+also enforce per-file type safety via `"isolatedModules": true` (or `verbatimModuleSyntax`). Without
+it, patterns such as re-exporting a type with `export { SomeType }` or using `const enum` type-check
+fine but are transpiled incorrectly by esbuild, since it cannot tell types from values across files.
+Enabling `isolatedModules` makes tsc reject these constructs.
+
+  "noEmit": true,
++     "isolatedModules": true,
+      "skipLibCheck": true
+
+
+─── scripts/publish.ps1:35-36 ───
+[bug · medium] The publish flow only checks npm's exit code, so it never verifies that this build
+actually produced a fresh NSIS installer. If the build exits 0 but bundling/NSIS did not run or was
+interrupted, the later `Sort-Object LastWriteTime -Descending | Select-Object -First 1` can silently
+select and publish an installer from an earlier build while reporting success. Record `$buildStart =
+Get-Date` before the build and only accept installers whose `LastWriteTime -ge $buildStart`,
+throwing 'no installer produced for this build' if none match. Also guard with `Test-Path $nsisDir`
+before enumerating so the intended friendly error is reached instead of Get-ChildItem's own path
+error, and add a deterministic tie-breaker for equal timestamps.
+
+
+
+─── scripts/publish.ps1:26-29 ───
+[bug · low] The header states that when HTTP_PROXY/HTTPS_PROXY are not set they default to
+http://127.0.0.1:10808, but the fallback only checks HTTP_PROXY. If HTTP_PROXY is already set while
+HTTPS_PROXY is empty, the two variables end up inconsistent and HTTPS traffic (e.g. cargo/crate
+downloads over TLS) gets no proxy, contradicting the documented default. Check and set each variable
+independently.
+
+  if (-not $env:HTTP_PROXY) {
+      $env:HTTP_PROXY = 'http://127.0.0.1:10808'
++ }
++ if (-not $env:HTTPS_PROXY) {
+      $env:HTTPS_PROXY = 'http://127.0.0.1:10808'
+  }
+
+
+─── scripts/publish.ps1:50-50 ───
+[bug · low] `Copy-Item -Force` silently overwrites a same-named installer in release/, which
+conflicts with the header's claim that all historical versions are preserved. History is only
+retained while filenames (versions) differ; re-publishing the same version destroys the earlier
+artifact. If same-version artifacts must be kept, copy to a timestamped/uniquified name; otherwise
+adjust the header so the overwrite behavior is documented.
+
+
+
+─── src-tauri/build.rs:4-4 ───
+[maintainability · medium] The tracked path `icons/icon.ico` is hardcoded here but must stay in sync
+with `bundle.icon`/`installerIcon` in `tauri.conf.json`. This duplicate source of truth can silently
+drift: if the icon list in the config is extended (e.g., `icons/icon.icns`/`icon.png` for
+non-Windows targets, both of which already exist in `src-tauri/icons/`) or the file is
+renamed/moved, Cargo treats a nonexistent `rerun-if-changed` path as a no-op (it only emits a
+warning), so this stale-icon workaround stops functioning unnoticed. Consider reading the icon list
+from `tauri.conf.json` (or at least also declaring `icons/icon.icns` and `icons/icon.png`) so all
+icons the bundler may consume trigger a rebuild.
+
+      println!("cargo:rerun-if-changed=icons/icon.ico");
++     println!("cargo:rerun-if-changed=icons/icon.icns");
++     println!("cargo:rerun-if-changed=icons/icon.png");
+
+
+─── src-tauri/src/commands.rs:89-92 ───
+[bug · high] Settings persistence failures are swallowed: the in-memory settings/zoom are changed
+first, and a save() error is only written to stderr via eprintln! while the command or apply() still
+returns Ok to the frontend. Disk keeps old values that resurface on restart, so the reported state
+diverges from persisted state. Propagate the save error to the caller (Err instead of Ok) and either
+persist before committing new values or roll back the in-memory/webview change on failure.
+
+          let dir = g.config_dir.clone();
+-         if let Err(e) = g.settings.save(&dir) {
+-             eprintln!("[dsh-ui] {e}");
+-         }
++         g.settings.save(&dir).map_err(|e| format!("保存设置失败：{e}"))?;
+
+
+─── src-tauri/src/commands.rs:76-79 ───
+[performance · medium] Saving settings holds the global Arc<Mutex<AppInner>> guard across
+g.settings.save(&dir), which performs blocking fs::write + fs::rename. On a slow/stalled filesystem,
+every other IPC command/state consumer that locks the same state (get_state, terminal input, zoom,
+emit_state) blocks. Keep the critical section limited to the in-memory update/serialization, release
+the guard before the disk write, then re-lock if needed to commit and emit state.
+
+
+
+─── src-tauri/src/commands.rs:22-27 ───
+[bug · medium] Terminal input can be silently lost. terminal_input returns success even when g.term
+is None (still booting, stopped, or exited), and TerminalSession::write discards write_all I/O
+errors with let _. Surface these failures to the frontend (return Result or expose a poisoned/closed
+flag) so keystrokes are not silently dropped and a dead session can be reported/torn down.
+
+- pub fn terminal_input(state: Inner<'_>, data: String) {
++ pub fn terminal_input(state: Inner<'_>, data: String) -> Result<(), String> {
+      let mut g = state.lock().unwrap();
+-     if let Some(t) = g.term.as_mut() {
+-         t.write(data.as_bytes());
+-     }
++     let t = g.term.as_mut().ok_or_else(|| "终端尚未就绪".to_string())?;
++     t.write(data.as_bytes()).map_err(|e| format!("终端写入失败：{e}"))
+  }
+
+
+─── src-tauri/src/commands.rs:65-67 ───
+[bug · low] `serde_json::to_value(...).unwrap_or_default()` converts any serialization failure into
+`Value::Null`, which is delivered to the frontend as a successful `get_settings` response, hiding
+the real conversion problem. Prefer returning `Result<serde_json::Value, String>` and propagating
+the error (or at least logging it) instead of masking it with a misleading default.
+
+
+
+─── src-tauri/src/commands.rs:100-102 ───
+[security · low] `open_browser` passes an arbitrary frontend-supplied string directly to the OS URL
+opener without validation. Any scheme (e.g. `file://`, `ms-settings:`, or custom protocol handlers)
+will be dispatched by the OS, which can be abused if this command is reachable from
+injected/untrusted web content. Validate that `url` parses as an `http`/`https` URL before invoking
+the opener.
+
+
+
+─── src-tauri/src/settings.rs:45-45 ───
+[bug · medium] `serde_json::from_str(&text).unwrap_or_default()` silently maps every parse error or
+type mismatch to `Settings::default()`. A single bad field in a hand-edited or partially migrated
+settings.json (e.g. `"port": "abc"`) therefore discards the *entire* user configuration, and since
+`save` later writes defaults back over the file, the original config is permanently lost.
+Distinguish a missing file from an unreadable/corrupt file: return `Result` from `load` (and only
+fall back to defaults when the file does not exist), or at minimum log the error and preserve a
+backup of the unparseable file instead of silently resetting.
+
+
+
+─── src-tauri/src/settings.rs:54-55 ───
+[bug · medium] Every caller of `save` writes to the same fixed `settings.json.tmp` with no lock or
+unique suffix. Tauri commands run concurrently on different threads, so two racing saves can
+interleave `fs::write` calls on the shared tmp file and `fs::rename` a torn/partially-written buffer
+into `settings.json`, permanently corrupting the settings; conversely a slow earlier save can rename
+stale content over a newer snapshot. Use a unique temp name (thread id/counter/uuid) and serialize
+saves (e.g. a `Mutex<()>` shared by callers or an async-friendly lock) so writers never share a temp
+path and the rename always publishes the latest complete snapshot.
+
+
+
+─── src-tauri/src/settings.rs:10-12 ───
+[bug · medium] These settings are persisted/validated as-is with no semantic checks, so
+invalid-but-representable values reach disk and IPC: `port: 0`, `zoom <= 0` (or absurdly large),
+`terminal_height_ratio` outside (0, 1], `ready_timeout_sec: 0`, or `use_system_proxy = false`
+combined with an empty `proxy_url` (proxy mode is selected but can never work, and no error is ever
+surfaced). Since this module is the disk/IPC boundary, add a `validate()`/normalize step invoked on
+load and before save that rejects out-of-range values with a typed error or clamps them to sane
+defaults, so bad values are caught once here instead of causing confusing runtime failures
+downstream.
+
+
+
+─── src-tauri/src/settings.rs:83-84 ───
+[maintainability · low] The same field list is hand-maintained in `Settings`, `SettingsIpc`,
+`Default`, and both `From` impls (plus the per-field round-trip test). Adding one setting requires
+edits in 5+ places, and a missed mapping in a `From` impl compiles fine while silently dropping the
+field across the IPC/disk boundary. Consider a single source of truth — e.g. a macro that generates
+both structs and the conversions, or storing canonical fields once and converting via serde
+`rename_all` — so the two representations cannot drift.
+
+
+
+─── src-tauri/src/terminal.rs:48-54 ───
+[bug · high] JobObject process-tree cleanup is racy and silently optional. The child (cmd.exe) is
+spawned and may already have launched descendants (e.g. via AutoRun) before assign() attaches it, so
+processes created in that window are not job members and survive KILL_ON_JOB_CLOSE; assigning an
+arbitrary already-running PID also risks PID reuse. Create the job before spawning and start the
+child suspended, assign it before it can create children, then resume; assign() should not be used
+on long-lived arbitrary PIDs. JobObject::new() returning None or assign() returning false is
+silently tolerated (the bool is discarded via let _), so a failed attach leaves orphaned processes
+with no diagnostic. Capture/return the OS error (GetLastError) so distinct causes (already in
+another job, access denied, invalid/exited PID) are not lost, and treat job creation/assignment
+failure as a hard error since teardown depends on it.
+
+
+
+─── src-tauri/src/terminal.rs:88-90 ───
+[bug · medium] resize() and kill() both discard their Result values. A failed resize (e.g. PTY
+already closed) is invisible, and a failed child.kill() leaves the cmd/node process tree running
+while the UI believes the session was terminated — combined with the job being optional above, this
+can leave real orphan processes. Propagate/log these errors so shutdown failures are observable.
+
+
+
+─── src-tauri/src/terminal.rs:84-86 ───
+[bug · medium] alive() maps any try_wait() error to false via unwrap_or(false), so a
+transient/platform wait error reports a still-running session as dead and invites premature
+teardown. Also, try_wait() is a reaping probe: it consumes the child's exit status, so later
+shutdown/exit-code reporting can no longer retrieve why the process ended. Consider returning
+Result<bool> (treating Err distinctly) and caching the ExitStatus when it becomes available.
+
+
+
+─── src-tauri/src/terminal.rs:31-38 ───
+[maintainability · medium] Each fallible setup step (openpty, spawn_command, try_clone_reader,
+take_writer) is reduced to a bare e.to_string() with no indication of which boundary failed, and the
+function's Err(String) discards the underlying error entirely — the caller cannot tell whether PTY
+creation, process launch, or handle duplication failed. Add per-step context, e.g. .map_err(|e|
+format!("openpty failed: {e}")) and ideally return a typed error (Box<dyn Error + Send + Sync>) so
+the cause survives to logging.
+
+
+
+─── src-tauri/src/job.rs:65-68 ───
+[maintainability · low] The safety rationale is inaccurate for `Sync`: declaring `Sync` together
+with a public `&self` method (`assign`) does permit concurrent cross-thread use (e.g. via
+`Arc<JobObject>`), so the comment's claim "无并发访问路径" is not actually guaranteed. Soundness rests on
+three invariants that should be stated explicitly: (1) the raw HANDLE is never duplicated, so
+`CloseHandle` runs exactly once; (2) `CloseHandle` happens only in `Drop`, which Rust guarantees
+cannot race with any live `&self` borrow; (3) concurrent kernel calls
+(`OpenProcess`/`AssignProcessToJobObject`) on one job handle are thread-safe. If a future refactor
+adds a non-`Sync` field or any `&self`-mutable state, this impl must be revisited.
+
+
+
+─── src-tauri/src/lib.rs:86-90 ───
+[security · medium] The navigation allowlist is overly broad: any `data:`/`about:` URL and any
+`http://localhost` / `http://127.0.0.1` URL (any port) is rendered inside the app window. The DSH UI
+content served by the local service is dynamic/repo-derived; once loaded it can navigate the top
+frame (e.g. `target=_top`) to an arbitrary local service on any port or to a crafted `data:`
+document. Those pages then render in the privileged window instead of being handed to the system
+browser as the external-link fallback intends, and if such a page ever reaches the app origin/IPC
+surface the impact is much larger. Recommend narrowing the allowlist to the app's own asset origins
+plus exactly the configured DSH server origin (`host` + `settings.port`, captured when building the
+window), and dropping the blanket `data:`/`about:` pass-through (keep only `about:blank` if truly
+needed).
+
++                 let is_dsh_service = scheme == "http"
++                     && (host == "127.0.0.1" || host == "localhost")
++                     && url.port() == Some(dsh_port);
+                  let local = scheme == "tauri"
+-                     || scheme == "data"
+-                     || scheme == "about"
+-                     || host == "tauri.localhost"
+-                     || (scheme == "http" && (host == "127.0.0.1" || host == "localhost"));
++                     || (scheme == "http" && host == "tauri.localhost")
++                     || is_dsh_service;
+
+
+─── src-tauri/src/lib.rs:75-78 ───
+[security · medium] The remote-debugging capability is gated only on the env var being present (any
+value, even "0"/"false" enables it), so a release build launched with this variable inherited from a
+shell/CI environment starts WebView2 with an unauthenticated DevTools endpoint on fixed port 9222.
+Any local process can connect to that endpoint to inspect the DSH session output and evaluate JS in
+the app page origin where Tauri IPC commands are reachable. Gate this (and the later
+`main.open_devtools()` block) behind `cfg!(debug_assertions)`, verify the endpoint binds only to
+loopback, and consider a non-default port to avoid collisions with other Chrome-based tooling.
+
+-             if std::env::var("DSH_DEBUG_DEVTOOLS").is_ok() {
++             if cfg!(debug_assertions) && std::env::var("DSH_DEBUG_DEVTOOLS").is_ok() {
+                  // WebView2 环境参数以首个 webview 为准
+                  main_builder = main_builder.additional_browser_args("--remote-debugging-port=9222");
+              }
+
+
+─── src-tauri/src/lib.rs:131-137 ───
+[bug · low] `server::handle_close` performs best-effort cleanup (launching a keep-alive background
+service or killing the service by port) and only reports failures via `eprintln!` / a
+`keepalive:failed` event. This handler ignores that outcome and unconditionally exits with code 0.
+When cleanup fails (e.g. `kill_by_port` errors or the keep-alive process cannot be spawned), the app
+still exits successfully while the background service is left in a state contrary to the user's
+choice, and the emitted failure event is delivered while the window is already closing, so it is
+never seen. Consider having `handle_close` return a `Result` and surfacing/logging the failure (and
+choosing a nonzero exit or blocking exit) instead of an unconditional silent `exit(0)`.
+
+                      WindowEvent::CloseRequested { .. } => {
+                          let app = window.app_handle().clone();
+-                         server::handle_close(&app);
+-                         // 主窗口关闭即退出应用（JobObject 自动清理进程树；
+-                         // keep-alive 模式下脱离进程已另行启动）
++                         if let Err(e) = server::handle_close(&app) {
++                             eprintln!("[dsh-ui] shutdown cleanup failed: {e}");
++                         }
+                          app.exit(0);
+                      }
+
+
+─── src-tauri/src/lib.rs:48-52 ───
+[maintainability · low] The `PathBuf::from("C:\\")` fallback is unreachable: `portable` can only be
+true when `exe_dir` is `Some`, so this arm is dead code. If it were ever reached, treating the
+filesystem root as the config directory would be wrong and `create_dir_all` would likely fail.
+Prefer requiring `exe_dir` when portable mode is enabled (propagate an error) instead of defaulting
+to `C:\`.
+
+              let config_dir = if portable {
+-                 exe_dir.clone().unwrap_or_else(|| PathBuf::from("C:\\"))
++                 exe_dir.clone().ok_or("portable mode requires a resolvable executable path")?
+              } else {
+                  app.path().app_config_dir()?
+              };
+
+
+─── src-tauri/src/download.rs:167-169 ───
+[security · high] This permission handler unconditionally ALLOWs
+COREWEBVIEW2_PERMISSION_KIND_MULTIPLE_AUTOMATIC_DOWNLOADS for every request, without checking the
+requesting origin (args.Uri()) or whether the action was user-initiated (args.IsUserInitiated()).
+Any page the WebView ever navigates to (or renders, e.g. an iframe/redirect) can therefore silently
+trigger an unbounded number of automatic downloads into the user's Downloads folder. Restrict ALLOW
+to trusted origins (the app's own frontend / localhost) and/or require the request to be
+user-initiated; otherwise leave the default permission behavior.
+
+                  if kind == COREWEBVIEW2_PERMISSION_KIND_MULTIPLE_AUTOMATIC_DOWNLOADS {
++                     // Only auto-allow for downloads initiated from the app's own content.
++                     let mut uri_pw = PWSTR::null();
++                     let _ = unsafe { args.Uri(&mut uri_pw) };
++                     if is_trusted_download_origin(&pwstr_to_string(uri_pw)) {
+                      let _ = unsafe { args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW) };
++                     }
+                  }
+
+
+─── src-tauri/src/download.rs:218-220 ───
+[bug · medium] If SetResultFilePath or SetHandled fails, the `?` operator aborts the callback before
+`download:starting` / `download:completed` are emitted, and `SetHandled` was never set, so WebView2
+treats the event as unhandled and cancels the download. The user sees no download and no error —
+exactly the silent-failure symptom this module is meant to prevent. On failure, still call
+SetHandled and emit an error/completion event so the frontend can surface the problem.
+
+              let hstr = windows_core::HSTRING::from(path.to_string_lossy().to_string());
+-             unsafe { args.SetResultFilePath(&hstr) }?;
+-             unsafe { args.SetHandled(true) }?;
++             if unsafe { args.SetResultFilePath(&hstr) }.is_err()
++                 || unsafe { args.SetHandled(true) }.is_err()
++             {
++                 let _ = handle.emit(
++                     "download:error",
++                     serde_json::json!({ "name": name, "path": path.to_string_lossy() }),
++                 );
++                 return Ok(());
++             }
+
+
+─── src-tauri/src/download.rs:99-102 ───
+[bug · medium] `sanitize_filename` only strips path separators and rejects colons, but Windows file
+names also forbid `< > " | ? *`, control characters 0x00–0x1F, trailing dots/spaces, and reserved
+device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9). Since the name originates from a
+server-controlled Content-Disposition header, names like `report?.zip`, `CON.zip`, or `evil.` pass
+this check and then make SetResultFilePath fail at runtime (silently, per the finding above). Extend
+the sanitizer to strip/reject these characters so the download either succeeds with a safe name or
+clearly fails.
+
+
+
+─── src-tauri/src/download.rs:227-229 ───
+[bug · medium] The results of add_PermissionRequested, add_StateChanged and add_DownloadStarting are
+all discarded with `let _ = ...`, and `[dsh-ui] download handler installed` is logged
+unconditionally. A failed event registration (e.g. wrong interface cast, COM failure) therefore
+makes the whole download feature silently non-functional while still logging success. Check each
+HRESULT and log/propagate a distinct error, or at least derive the final log line from the actual
+registration results.
+
+          let mut token: i64 = 0;
+-         let _ = unsafe { wv4.add_DownloadStarting(&handler, &mut token) };
++         if unsafe { wv4.add_DownloadStarting(&handler, &mut token) }.is_err() {
++             eprintln!("[dsh-ui] download: add_DownloadStarting failed");
++             return;
++         }
+          eprintln!("[dsh-ui] download handler installed");
+
+
+─── src-tauri/src/download.rs:30-30 ───
+[bug · low] When USERPROFILE is unset, download_dir() falls back to the root of the current drive
+("C:\\"). Writing directly to a drive root requires administrator privileges for standard users, so
+the subsequent SetResultFilePath would fail and the download would be silently canceled. A safer
+fallback is std::env::temp_dir() or the current working directory; alternatively create the
+Downloads folder rather than degrading to a location where saves are likely to fail.
+
+
+
+─── src-tauri/src/auth.rs:134-139 ───
+[bug · high] ICoreWebView2Cookie.Expires is documented in seconds since 1601-01-01 (the Windows
+FILETIME epoch), not seconds since the Unix epoch (1970) as the module doc and this comment assume.
+The value written here (~now since 1970 ≈ 1.8e9) is therefore roughly 370 years in the past relative
+to the 1601 epoch, so Chromium treats the cookie as already expired: it won't get the intended
+30-day persistence and may not be sent at all, breaking the cross-site iframe RPC auth. Add the
+1601→1970 offset (11_644_473_600 s) before adding COOKIE_TTL_SECS (and fix the misleading 'Expires =
+unix 秒' comment in the module header).
+
+-             // 持久化：Expires = unix 秒；此处按官方语义设 now + TTL
++             // WebView2 Expires is in seconds since 1601-01-01 (FILETIME epoch).
+              let now = SystemTime::now()
+                  .duration_since(UNIX_EPOCH)
+                  .map(|d| d.as_secs_f64())
+-                 .unwrap_or(0.0);
+-             let _ = cookie.SetExpires(now + COOKIE_TTL_SECS);
++                 .unwrap_or(0.0)
++                 + 11_644_473_600.0; // offset from 1601-01-01 to 1970-01-01
++             if cookie.SetExpires(now + COOKIE_TTL_SECS).is_err() {
++                 done(false);
++                 return;
++             }
+
+
+─── src-tauri/src/auth.rs:129-133 ───
+[bug · medium] All four ICoreWebView2Cookie setters return HRESULTs that are silently discarded with
+`let _ =`. SameSite=None + Secure are exactly the attributes that make the cookie usable from the
+cross-site iframe; if any setter fails (especially SetSameSite/SetIsSecure), the cookie is still
+added and `done(true)` is reported, so the UI is told authentication succeeded while the injected
+cookie will never be sent on cross-site RPC requests. Check each Result and route failures through
+`done(false)`/logging, as already done for AddOrUpdateCookie.
+
+
+
+─── src-tauri/src/auth.rs:98-98 ───
+[bug · medium] `with_webview` returns `Result` and the return value is discarded here. If the
+platform fails to schedule/run the closure (e.g., the webview was already destroyed or the call is
+invalid), `done` is never invoked, yet the function's documented contract states it calls `done`
+after completion *or failure* — leaving the caller (front-end refresh) waiting forever. On `Err` you
+should invoke `done(false)` so the pending promise/callback is always resolved.
+
+-     let _ = win.as_ref().with_webview(move |platform: PlatformWebview| {
++     if let Err(e) = win.as_ref().with_webview(move |platform: PlatformWebview| {
++         // ... existing body ...
++     }) {
++         eprintln!("[dsh-ui] with_webview failed: {e}");
++         done(false);
++     }
+
+
+─── src-tauri/src/auth.rs:62-65 ───
+[security · medium] `exchange_cookie` never validates the HTTP status line (nor handles redirects):
+the first Set-Cookie found in any response is accepted as a successful auth exchange and later
+injected into WebView2. A 4xx/5xx error page, a redirect landing page, or an unrelated local process
+answering on the parsed port could therefore have its cookie injected as an authentication cookie.
+Additionally, the scan keeps reading the whole stream and splits lines from the accumulated buffer
+even *after* the `\r\n\r\n` header terminator (i.e. the body is searched for `set-cookie:` lines
+too), so body content can produce false matches. Parse only the header section before the blank line
+and require a 2xx status before returning a cookie.
+
+
+
+─── src-tauri/src/zoom.rs:38-45 ───
+[bug · medium] `step` performs a check-then-act read-modify-write across two separate lock
+acquisitions: it reads `g.zoom` under one lock, releases it, and then `apply` re-locks the mutex to
+write the computed value. Two concurrent `step`/`set` calls can both read the same base zoom, and
+the last writer wins — silently dropping an increment. Make the read-compute-apply sequence atomic
+under a single critical section (e.g. a mutex-protected entry point that both computes and applies,
+or keep the zoom base in an atomic that is updated atomically).
+
+
+
+─── src-tauri/src/zoom.rs:27-28 ───
+[maintainability · low] The zoom value is stored in two places that must be kept in sync
+(`AppInner.zoom` and `AppInner.settings.zoom`), and this function writes both explicitly. Any future
+code path that updates only one of the fields will silently diverge, causing `step` and startup
+restore to behave inconsistently. Prefer a single source of truth (e.g. keep the value only in
+`settings.zoom` and expose an accessor, or add an invariant check/getter) instead of requiring every
+mutation site to remember both assignments.
+
+
+
+─── src-tauri/src/zoom.rs:12-14 ───
+[bug · low] `clamp` does not reject non-finite input: `f64::clamp` only panics on NaN min/max and
+returns NaN unchanged when `self` is NaN. So `zoom_set`/`apply` with a NaN factor (e.g. NaN produced
+on the front end) will propagate NaN into `set_zoom` and persist it into settings, where it can
+corrupt later zoom restore. Reject non-finite values at the entry point, e.g. `if
+!factor.is_finite() { return Err(...); }` before clamping.
+
+
+
+─── src-tauri/src/server.rs:837-840 ───
+[bug · high] Both probe paths validate the generation counter in one lock acquisition and then
+perform side effects under separate locks without re-checking, letting a concurrent restart()/stop()
+make a stale probe mutate the new generation. In the Ready path, after the gen check the code
+separately clears restart_count, sets Phase::Ready, and calls start_keepalive; in the
+failure-pattern reader, gen is checked in one lock and later probe_stop / Phase::Failed is set under
+another. Validate and commit all side effects atomically in a single locked section (g.gen == gen &&
+!g.probe_stop), and bail out whenever the generation is stale.
+
+
+
+─── src-tauri/src/server.rs:843-846 ───
+[bug · medium] Ready can be emitted before the auth-cookie flow has even started, defeating the
+intended gating. For dsh ≥ 0.1.2-rc.1 the root request returns 401 as soon as the listener is up, so
+`http_responsive()` returns true while the reader thread may not yet have parsed the printed `dsh
+web: …?token=` line and set `auth_pending`. At that instant `!g.auth_pending` is indistinguishable
+from 'legacy dsh, no auth needed', so the probe commits `Phase::Ready` and the iframe requests `/`
+without a cookie → 401; the later cookie injection never reloads the page. Introduce a short grace
+period after the first HTTP response (a few poll cycles) so the reader has time to observe the token
+line and set `auth_pending`/`auth_done` before Ready is committed, or have the reader set auth
+expectations before the server can be probed.
+
+
+
+─── src-tauri/src/server.rs:1052-1055 ───
+[bug · high] This 'keep running' branch launches a detached second instance of `startup_command` on
+the same port without first stopping the current `TerminalSession` or checking who owns the port.
+The existing service (still inside this app's JobObject, and usually still listening) races the new
+process — the detached copy typically dies with EADDRINUSE, then the JobObject teardown kills the
+old tree and the user is left with no service despite choosing 'keep running'. Worse, if the port is
+already held by a detached service from a previous run (which will survive this exit anyway),
+spawning another copy is both unnecessary and harmful. Before spawning, stop the current session and
+wait/poll until the port is actually released (`kill_by_port` semantics), and skip the launch when
+the port is already served by a surviving process.
+
+
+
+─── src-tauri/src/server.rs:746-746 ───
+[security · medium] `web_url` carries the launch `token=` credential in its query string; logging
+the whole URL on the failure path writes the secret to stderr/logs (the same token is later injected
+as the session cookie). Log an error message without the URL, or redact the query string.
+
+
+
+─── src-tauri/src/server.rs:167-169 ───
+[bug · medium] `decode_project_key` panics when the key reduces to a lone drive letter (e.g. a
+session whose workspace is a drive root `C:\`, persisted as `--C--`): after extracting the drive,
+`rest` is empty, `n == 0`, and `rest[0]` indexes out of bounds. This function is invoked from
+`find_last_workspace()` while the `AppInner` mutex is held in `start_session()`, so the panic
+poisons the mutex and every later `lock().unwrap()` in the process fails. Guard the
+`rest.is_empty()` case and return the drive root as the candidate (or an empty list) instead of
+indexing.
+
+
+
+─── src-tauri/Cargo.toml:1-6 ───
+[documentation · medium] Missing license/repository metadata: `[package]` declares neither
+`license`/`license-file` nor `repository`. Even though this is an application crate rather than a
+published library, the packaged/installer artifacts still carry the crate metadata, and without a
+license field the distribution terms of the shipped binary and its bundled assets are ambiguous. Add
+an explicit `license` (or `license-file`) and, if the source is hosted, `repository`.
+
+  [package]
+  name = "dsh-ui"
+  version = "0.1.26"
+  description = "DeepSeek Harness desktop shell: embedded cmd terminal + webview wrapper"
+  authors = ["dsh-ui"]
++ license = "MIT OR Apache-2.0"
++ repository = "https://github.com/<owner>/dsh-ui"
+  edition = "2021"
+
+
+─── src-tauri/Cargo.toml:18-18 ───
+[security · medium] The `devtools` feature on the `tauri` dependency is enabled unconditionally, so
+DevTools support is compiled into release builds as well as debug builds. This shell injects
+session/auth cookies into the WebView2 context (see src/auth.rs), and the source currently gates
+opening DevTools only on the `DSH_DEBUG_DEVTOOLS` environment variable — meaning any release process
+launched with that env var set exposes the webview internals/session data. Prefer gating the feature
+so it is only enabled when building dev/debug artifacts, e.g. declare `devtools =
+["tauri/devtools"]` under `[features]` and build with `--features devtools` only for development,
+rather than shipping it in production binaries.
+
+- tauri = { version = "2", features = ["devtools"] }
++ tauri = { version = "2", features = [] }
+
+
+─── src-tauri/Cargo.toml:25-27 ───
+[maintainability · low] Windows crate generation mismatch: the direct pins here (`windows-sys 0.59`,
+`windows-core 0.61`) resolve to the windows 0.59/0.61 generation (`windows-targets 0.52.6`,
+`windows-link 0.1.3`), while the locked tauri/wry stack pulls the newer generation (`windows-core
+0.62.2`, `windows-sys 0.60.2/0.61.2`). The lock file therefore contains two copies of `windows-core`
+and three of `windows-sys`. This only compiles because the two generations never exchange typed
+handles today (job.rs uses raw `HANDLE`s and webview2-com is its own COM layer), but it is fragile:
+any code passing a window/core type from this crate's generation to a tauri/wry API (e.g.
+HWND/RawWindowHandle conversion) will hit an opaque type mismatch. Since `webview2-com 0.38.2`
+requires `windows-core 0.61`, these pins must be bumped as a set together with the `webview2-com`
+version once tauri/wry move to a single generation, or the mixing should be documented with a
+lock-file check.
+
+
+
+─── ui/src/ipc.ts:59-64 ───
+[maintainability · medium] StateChangedPayload is a hand-duplicated copy of AppState (identical
+fields: phase/message?/url/zoom). Both map to the same backend data — get_state and the
+`state:changed` emit produce the exact same JSON (src-tauri/src/commands.rs / server.rs). Keeping
+two separate types means a field added to AppState won't force a review of the event type and the
+shapes can silently drift, breaking UI updates without a compile-time error. Reuse AppState as the
+single source of truth.
+
+- export interface StateChangedPayload {
+-   phase: Phase;
+-   message?: string;
+-   url: string;
+-   zoom: number;
+- }
++ export type StateChangedPayload = AppState;
+
+
+─── ui/src/ipc.ts:28-28 ───
+[maintainability · low] DEFAULT_SETTINGS is exported as a mutable, non-readonly `Settings` object
+shared app-wide as the fallback default (e.g. shell.ts builds initial state via `{
+...DEFAULT_SETTINGS }`). Because the object itself is exported mutable, any consumer that
+accidentally writes to a property (e.g. `DEFAULT_SETTINGS.port = ...`) would poison the default for
+all other consumers. These values also duplicate the Rust defaults in src-tauri/src/settings.rs and
+must be kept in sync manually. Consider typing it `Readonly<Settings>` and/or wrapping it in
+`Object.freeze(...)` so accidental mutation fails at compile time.
+
+- export const DEFAULT_SETTINGS: Settings = {
++ export const DEFAULT_SETTINGS: Readonly<Settings> = {
+
+
+─── ui/src/ipc.ts:43-44 ───
+[maintainability · low] IPC promises are invoked without rejection handling in several places: the
+`cmd` wrappers forward raw `invoke` promises, and shell.ts fire-and-forgets
+`cmd.zoomStep(...).then(...)`, restart/stop/retry, and `cmd.openBrowser(url)` with no
+`.catch()`/try-catch. Backend `Result<_, String>`/IPC errors therefore become unhandled rejections
+and UI failures are silent. Centralize IPC invocation in a typed helper that catches/logs/normalizes
+errors so callers cannot forget, and/or add `.catch()`/async try-catch at each UI call site with
+feedback via `log()`/`showSaveTip()`/error UI.
+
+
+
+─── ui/vite.config.ts:6-6 ───
+[bug · medium] The root package.json declares `"type": "module"`, so this `.ts` config is treated as
+an ES module. `__dirname` is not a global in ESM — it only works because Vite's config loader
+bundles and rewrites it (version/loader dependent); if the config is ever loaded directly by Node or
+by a Vite version without that shim, it throws `ReferenceError: __dirname is not defined` and both
+the dev server and build (`npm run dev:ui` / `build:ui`) fail. Make it ESM-safe by deriving the
+directory explicitly and reusing it on line 6 and in the `resolve(__dirname, "index.html")` call on
+line 19.
+
+-   root: __dirname,
++ import { fileURLToPath } from "node:url";
++
++ const rootDir = fileURLToPath(new URL(".", import.meta.url));
++
++   root: rootDir,
+
+
+─── ui/src/shell.ts:352-356 ───
+[bug · high] Saving settings reconstructs the entire `Settings` object with hardcoded values for
+fields the modal does not edit: `zoom: 1.0`, `autoStart: true`, and `terminalHeightRatio:
+DEFAULT_SETTINGS.terminalHeightRatio`. Any user preference previously persisted for these fields
+(e.g., a zoom level set with the toolbar, auto-start disabled, or a custom terminal height) is
+silently overwritten every time they save an unrelated change like proxy/command. The modal-open
+handler already fetched current settings (`s`); keep a reference to them and merge only the fields
+actually edited in the modal (or re-fetch before saving) so these three values are preserved.
+
+
+
+─── ui/src/shell.ts:188-189 ───
+[bug · medium] Snapshot/live-subscription race: this async block awaits `cmd.getTerminalBuffer()`
+and only registers `onTerminalData` afterwards. Output emitted by the backend between the snapshot
+capture and listener registration belongs to neither the snapshot nor the live stream, so it is
+permanently dropped — exactly the early-startup window the comment above intends to cover. Register
+the live handler first into a small pending buffer, then write the snapshot and flush the buffered
+events in order, or have the backend atomically snapshot at subscription time.
+
+
+
+─── ui/src/shell.ts:136-143 ───
+[bug · medium] `applyState` phase branches only update a subset of related elements and rely on
+`bootMask.hidden` to mask leftovers, which is not idempotent across arbitrary (non-adjacent) state
+transitions. E.g., the `ready` branch never resets `errorBox`/`spinner`/`phaseText` after a prior
+failed/stopped state, while `failed` does not hide `browserBtn` even though `stopped` does; the
+DOM/`hidden` flags can thus be stale if the mask is later shown again or an element is toggled
+independently. Consider resetting all stateful elements (errorBox, spinner, phaseText, errorText,
+browserBtn, floatBtn, loaded-frame handling) at the top of `applyState` before applying
+phase-specific visibility/text.
+
+
+
+─── .gitignore:10-11 ───
+[security · medium] The bare `.env` pattern only matches a file named exactly `.env`. Vite/Node
+tooling commonly creates `.env.local`, `.env.development`, `.env.production.local`, etc. If any of
+these variants is introduced and committed, secrets could leak. Consider ignoring all env variants
+while keeping an intentional template trackable, e.g.:
+```
+.env
+.env.*
+!.env.example
+```
+Also note ignore rules only affect untracked files — if `.env`/`.npmrc` were already tracked before
+being added here, they remain in the index and need `git rm --cached`.
+
+
+
+─── .gitignore:7-7 ───
+[maintainability · low] `*.log` only matches names ending exactly in `.log`. Rotated/archived logs
+such as `.log.1`, `.log.gz`, or `npm-debug.log.*` will not match and could be committed. If log
+rotation is used, also cover those patterns (e.g. `*.log`, `*.log.*`, `logs/`) — or conversely, if
+rotation is not used this is fine as-is.
+
+
+
+─── .gitignore:1-4 ───
+[maintainability · low] The ignore list covers this repo's primary build outputs, but common
+transient/contributor-local files are unprotected and can easily be committed accidentally: OS junk
+(`.DS_Store`, `Thumbs.db`), editor/IDE dirs (`.idea/`, `.vscode/`, `*.swp`), and tool caches
+(`ui/.vite/`, `*.tsbuildinfo`, `.eslintcache`, coverage output). Consider adding a short set of
+generic rules so future artifacts don't slip into commits.
+
+
+
+
+──────── Project Summary ────────
+
+### Top Issues
+
+1. **Silent error swallowing is endemic in the Rust backend.** Multiple subsystems discard failures and still report success to the UI: terminal writes/resizes/kills (`src-tauri/src/terminal.rs`), settings persistence (`src-tauri/src/commands.rs` changes state, then `eprintln!`s the save error and returns `Ok`), cookie setters (`src-tauri/src/auth.rs`, four HRESULTs dropped), download handler setup (`src-tauri/src/download.rs`), and serialization fallbacks (`serde_json::to_value(...).unwrap_or_default()` in `commands.rs` turns failure into `Value::Null`). The recurring impact is that the UI shows success while disks, processes, and cookies silently keep old/partial state.
+
+2. **Check-then-act races across lock acquisitions.** `src-tauri/src/zoom.rs` reads `g.zoom` under one lock, releases it, and writes under a second lock; `src-tauri/src/server.rs` validates the generation counter in one lock scope and performs side effects in another without re-checking; `src-tauri/src/settings.rs` has all callers write the same `settings.json.tmp` with no lock or unique suffix, so concurrent saves can interleave and rename a torn file. The same pattern appears client-side in `ui/src/shell.ts` (terminal snapshot taken before live-stream listener registration drops the gap output).
+
+3. **The app trusts URLs, origins, and schemes it should not.** `src-tauri/src/lib.rs` allows any `data:`/`about:` URL and any `http://localhost`/`127.0.0.1` port into the top frame; `ui/index.html` assigns the backend-reported URL to a shell iframe with no `sandbox` attribute; `src-tauri/src/commands.rs` `open_browser` passes an arbitrary frontend-supplied string (any scheme) to the OS opener; `src-tauri/src/download.rs` unconditionally ALLOWs multi-download permission for any origin; `src-tauri/src/auth.rs` accepts the first `Set-Cookie` in any HTTP response (including 4xx/5xx/redirect pages). Release hardening is also undermined by unconditional `devtools` in `src-tauri/Cargo.toml` and remote debugging enabled by *any* value of the env var in `lib.rs`.
+
+4. **Settings persistence is one bad field away from total config loss, and the settings surface is duplicated everywhere.** `src-tauri/src/settings.rs` maps every parse/type error to `Settings::default()`, so one hand-edited or migrated bad field wipes the whole user configuration. The same file hand-maintains the field list in 5+ places (struct, IPC struct, `Default`, two `From` impls), `src-tauri/src/zoom.rs` stores zoom in two fields that must be kept in sync, and `ui/src/shell.ts` reconstructs the entire `Settings` object with hardcoded values (`zoom: 1.0`, `autoStart: true`) for fields the modal doesn't edit — silently discarding prior user preferences.
+
+5. **Terminal/process lifecycle can orphan process trees or fight over a port.** `src-tauri/src/terminal.rs` attaches the JobObject *after* `cmd.exe` is spawned, so descendants launched in that window (e.g., AutoRun) escape `KILL_ON_JOB_CLOSE`; a failed `child.kill()` is invisible to the UI. `src-tauri/src/server.rs`'s keep-running branch launches a detached second instance of `startup_command` on the same port without stopping the current session or checking port ownership, and `alive()` in `terminal.rs` treats any `try_wait()` error as "dead," inviting premature teardown.
+
+6. **Crash/poison paths in parsing and numeric handling.** `src-tauri/src/server.rs` `decode_project_key` panics with an out-of-bounds index when a workspace is a drive root (`--C--`); `src-tauri/src/zoom.rs` propagates NaN (the `clamp` only guards the min/max, not `self`); `ui/index.html` allows fractional/exponent port input (`3080.5`, `1e2`) that reaches `u16` parsing; `src-tauri/src/settings.rs` persists semantically invalid values like `port: 0` and `zoom <= 0`.
+
+7. **Frontend failure modes leave the user stuck with no diagnostics.** `ui/index.html` has no `<noscript>`, `onerror`, or watchdog, so a module/IPC failure leaves the boot mask and spinner up forever. `ui/src/shell.ts` `applyState` only updates a subset of elements per phase and relies on `bootMask.hidden` to mask leftovers, so non-adjacent transitions (e.g., `failed` → `ready`) leave stale error/spinner state. Compounding this, `ui/src/styles.css` disables `user-select` on boot/error text so users can't even copy the failure output.
+
+8. **Release pipeline can silently ship nothing or destroy history.** `scripts/publish.ps1` only checks npm's exit code, never verifying an NSIS installer was actually produced before `Sort-Object ... | Select-Object -First 1` picks an artifact — potentially a stale one; `Copy-Item -Force` overwrites same-version historical installers despite the header claiming all versions are preserved.
+
+### Module Hotspots
+
+- **`src-tauri/src/`** — 35 of the 62 comments concentrate here. `server.rs`, `commands.rs`, `download.rs` (5 each), `terminal.rs`, `settings.rs`, `auth.rs` (4 each) carry the highest density, dominated by race conditions, discarded errors, and unvalidated input.
+- **`ui/src/` and `ui/index.html`** — 11 comments across `shell.ts`, `ipc.ts`, `styles.css`, and `index.html`, mostly about unrecoverable UI states, duplicated state types, and settings being rewritten with hardcoded defaults.
+- **`scripts/publish.ps1`** — only 3 comments but all point at artifact-verification and overwrite bugs in the release path.
+- **`src-tauri/Cargo.toml` + `build.rs`** — release config (unconditional devtools), crate metadata, Windows crate-generation mismatch, and a duplicated icon source of truth.
+
+### Cross-Cutting Concerns
+
+- **Discarded `Result`/HRESULT values and `unwrap_or_default` fallbacks** — the dominant pattern. Representative: `src-tauri/src/terminal.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/auth.rs`, `src-tauri/src/download.rs`, `src-tauri/src/settings.rs`.
+- **State/type duplication requiring manual sync** — `Settings` field list in `src-tauri/src/settings.rs`; zoom stored twice in `src-tauri/src/zoom.rs`; `StateChangedPayload` hand-duplicated from `AppState` in `ui/src/ipc.ts`; icon list duplicated between `src-tauri/build.rs` and `tauri.conf.json`; full `Settings` reconstruction in `ui/src/shell.ts`. Every one of these compiles fine while silently drifting.
+- **Unsafe cross-thread mutation and lock misuse** — check-then-act in `src-tauri/src/zoom.rs` and `src-tauri/src/server.rs`; blocking `fs::write`/`rename` while holding the global `Arc<Mutex<AppInner>>` in `commands.rs`; inaccurate `Sync` rationale in `src-tauri/src/job.rs`; the snapshot/listener race in `ui/src/shell.ts`.
+- **Trusting frontend/service-provided strings at trust boundaries** — `open_browser` scheme passthrough (`commands.rs`), iframe `src` assignment without sandbox (`ui/index.html`), permissive navigation allowlist (`lib.rs`), unvalidated cookie source (`auth.rs`), permissive download permission (`download.rs`).
+- **Windows-specific correctness assumptions** — `sanitize_filename` in `download.rs` misses reserved names/characters; `download_dir` falls back to the drive root when `USERPROFILE` is unset; `decode_project_key` assumes a path always has a non-drive remainder; cookie `Expires` treated as Unix epoch in `auth.rs` instead of the FILETIME epoch (~370 years off).
+- **Fire-and-forget IPC calls with no rejection handling** — `ui/src/ipc.ts` wrappers and `ui/src/shell.ts` calls (`zoomStep`, restart/stop/retry, `openBrowser`) with no `.catch()`.
+
+### Quick Wins
+
+- **Redact the `token=` query string** before logging `web_url` in `src-tauri/src/server.rs`; log an error without the URL. One-line, removes a credential leak.
+- **Add `step="1"` and integer rounding/clamping** for the port input in `ui/index.html`, and reject NaN in `src-tauri/src/zoom.rs` `clamp` — blocks corrupted settings/URLs at the cheapest layer.
+- **Re-enable `user-select: text`** on `.boot-terminal` and `.error-text` in `ui/src/styles.css`, matching the existing `.panel-log`/`.modal-card` pattern so failure output is copiable.
+- **Fix the system-proxy checkbox default in `ui/index.html`** to match `cfgProxy.disabled = cfgSysProxy.checked` in the runtime, and stop persisting the proxy field when system proxy is checked.
+- **Attach `.catch()` handlers** to the fire-and-forget IPC calls in `ui/src/shell.ts` so backend errors surface instead of vanishing into unhandled rejections.
+- **Tighten `.gitignore`** for env variants (`.env.local`, etc.), rotated logs (`*.log.*`), OS junk (`.DS_Store`, `Thumbs.db`), and editor dirs (`.idea/`, `.vscode/`).
+- **Enable `isolatedModules` (or `verbatimModuleSyntax`) and add `@types/node`** to `ui/tsconfig.json` so tsc matches esbuild's per-file transpilation and `vite.config.ts` type-checks; replace `__dirname` in `ui/vite.config.ts` with an ESM-safe equivalent.
+- **Validate the settings save result** in `src-tauri/src/commands.rs` (return an error/`Result` to the frontend instead of `eprintln!` + `Ok`) — small signature change, eliminates the most visible false-success case.
