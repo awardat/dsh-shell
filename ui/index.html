@@ -7,8 +7,15 @@
     <link rel="stylesheet" href="./src/styles.css" />
   </head>
   <body class="shell-body">
-    <!-- DSH UI（iframe，就绪后加载） -->
-    <iframe id="app-frame" class="app-frame" title="DeepSeek Harness"></iframe>
+    <!-- DSH UI（iframe，就绪后加载）；
+         allow 委派剪贴板权限：跨源 iframe 默认不允许 clipboard-write，
+         否则 DSH UI 的「复制代码块」按钮点击无效 -->
+    <iframe
+      id="app-frame"
+      class="app-frame"
+      title="DeepSeek Harness"
+      allow="clipboard-read; clipboard-write"
+    ></iframe>
 
     <!-- 启动遮罩（就绪前显示状态） -->
     <div id="boot-mask" class="boot-mask">

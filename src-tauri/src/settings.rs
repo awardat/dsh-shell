@@ -91,12 +91,6 @@ impl Settings {
             }
         }
     }
-
-    pub fn save(&self, dir: &PathBuf) -> Result<(), String> {
-        let text =
-            serde_json::to_string_pretty(self).map_err(|e| format!("序列化设置失败：{e}"))?;
-        write_settings(dir, &text)
-    }
 }
 
 /// 原子写盘（唯一临时文件 + 串行化；锁外调用：不持有 AppInner 状态锁）

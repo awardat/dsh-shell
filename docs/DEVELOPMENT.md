@@ -61,8 +61,8 @@ npm run build
 - 安装包复制到 `<项目根>\release\`（**所有历史版本保留，不清理**，同名版本覆盖）；
 - 脚本自动配置 GNU 工具链 PATH 与代理（未设置时默认 `http://127.0.0.1:10808`）。
 
-> **版本号约定**：每次功能改动，版本号**第三段 +1**，前两段保持不变（当前 0.1.27，
-> 由 0.1.0 累计 27 次改动而来）。同步修改三处：
+> **版本号约定**：每次功能改动，版本号**第三段 +1**，前两段保持不变（当前 0.1.29，
+> 由 0.1.0 累计 29 次改动而来）。同步修改三处：
 > `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`package.json`。
 > 安装包命名 `dsh_shell_<版本>_<架构>-setup.exe`（由 `productName: "dsh_shell"` 驱动）。
 > 每次发版同步更新 `README.md` 的「更新记录」章节（与版本一一对应）。
@@ -129,10 +129,14 @@ npm run dev
 `src-tauri/src/download.rs` 通过 `Webview::with_webview` 拿 PlatformWebview →
 `ICoreWebView2_4` 挂 `DownloadStarting`、`ICoreWebView2_8` 挂 `PermissionRequested`：
 
-- **PermissionRequested**：自动允许 `MULTIPLE_AUTOMATIC_DOWNLOADS`（否则 WebView2 弹
-  `edge://permission-request-dialog`，下载卡住）；
+- **PermissionRequested**：允许 `MULTIPLE_AUTOMATIC_DOWNLOADS`（否则 WebView2 弹
+  `edge://permission-request-dialog`，下载卡住），但**仅放行来源为 loopback /
+  `tauri.localhost` 的请求**，其余保持默认拒绝；
 - **DownloadStarting**：解析文件名（Content-Disposition → query 的 sessionId 兜底），
-  保存到 `%USERPROFILE%\Downloads`，`SetResultFilePath + SetHandled`；
+  经 `sanitize_filename` 清洗（剥路径、拒穿越与盘符、过滤 `< > " | ? *`、控制字符、
+  尾部点/空格、Windows 保留设备名），保存到 `%USERPROFILE%\Downloads`（取不到时
+  `temp_dir()`），`SetResultFilePath + SetHandled`——两者失败会发 `download:completed{ok:false}`
+  而不是静默卡住；
 - **StateChanged**：下载终态 → 前端 `download:completed` 事件（面板日志）。
 
 > 背景：wry 默认下载 handler 只放行不设路径（`|_, _| true`），WebView2 无内置
@@ -164,6 +168,23 @@ iframe 内快捷键不可注入——跨域限制，缩放按钮不受影响）�
   当前两代类型无交叉（job.rs 用裸 HANDLE、webview2-com 自持 COM 层）可编译；
   一旦代码需要向 tauri/wry API 传递本 crate 代的窗口/内核类型将出现不透明类型不匹配。
   **跟踪**：随 `webview2-com` 升级（连带 windows 代）一并解决。
+- **跨源 iframe 内「页面级」拖拽自动滚动失效（WebView2 / OOPIF）**：DSH UI 以跨源
+  iframe（`http://127.0.0.1:<port>`）嵌入壳（顶层 `http://tauri.localhost`），WebView2 将其
+  放入独立进程（OOPIF）。CDP 模拟拖拽选择的实测结论：
+  - **容器级** autoscroll（`overflow:auto` 元素，含 `container-type:inline-size` /
+    `contain:layout style`）**正常**（scrollTop 随拖拽增长）；
+  - **页面级** autoscroll（`document.scrollingElement`）**不滚动**（拖拽能扩展选择，scrollTop 恒为 0）。
+  DSH 多数视图在容器内滚动（`ChatView.module.css` 的 `.scroll { overflow-y:auto }`）不受影响；
+  但 `[data-conversation-scroll]` 模式下 `.scroll { overflow: visible }` 把滚动交给页面级 →
+  该视图下手动拖选长内容/代码块时内容不跟随滚动（浏览器直连访问同一页面正常）。
+  已验证 `--disable-features=IsolateOrigins,site-per-process` **无效**（WebView2 忽略，iframe 仍是
+  独立 target）。壳层暂无直接修复手段；后续方向：DSH 侧在该模式下也使用容器滚动（不改 harness
+  前提下需上游处理），或壳改同源架构（需重写资源/API/认证，风险高）。
+- **`additional_browser_args` 是覆盖语义**（`lib.rs`）：多次调用只保留最后一次，新增 WebView2
+  参数时务必一次性拼接传入（否则先前的参数会被静默丢弃）。
+- **CSP 未设置（`tauri.conf.json` 的 `app.security.csp: null`，观察项）**：当前 shell 页面只加载
+  本地资产 + 一个受控的 loopback iframe，导航已收窄到配置端口、下载已校验来源，风险可接受。
+  若后续引入远程资源或注入脚本，需补最小可用 CSP 并回归验证。
 - **JobObject attach 窗口**（`terminal.rs`）：portable-pty 在 spawn 之后才允许 attach，
   spawn→attach 窗口内 cmd 自行派生的进程（如 AutoRun）不在作业内、退出时可能残留；
   attach 失败已记录日志。此为 portable-pty API 限制，无 pre-spawn 挂起改造路径。
@@ -177,18 +198,21 @@ src-tauri/src/
 │                       # 重启/手动停止（按端口杀 detached）、退出清理（keep-alive 脱离 +
 │                       # 关闭时询问是否结束后台服务）、最后会话 workspace 跟随、
 │                       # 首次运行检测（dsh_available → 下载提示 + 超时放宽）、
-│                       # 代理 env 应用（系统代理/自定义，供 npx 下载）
+│                       # 代理 env 应用（系统代理/自定义，供 pnpm/npx 下载）、
+│                       # 终端输出扫描（失败特征、下载特征、token 行）
+├─ auth.rs              # dsh ≥ 0.1.2-rc.1 浏览器认证：解析 token URL → HTTP 换 cookie →
+│                       # WebView2 CookieManager 注入（SameSite=None + Secure + 30 天）
 ├─ terminal.rs          # ConPTY 会话（portable-pty）：cmd.exe + 进程树 Job Object
 ├─ zoom.rs              # 缩放（50–300%）：应用/持久化
-├─ download.rs          # WebView2 下载支持（下载起始/权限/完成事件）
+├─ download.rs          # WebView2 下载支持（下载起始/权限/完成事件；来源校验 + 文件名清洗）
 ├─ job.rs               # Windows Job Object（KILL_ON_JOB_CLOSE 退出清树）
-├─ settings.rs          # settings.json 读写
+├─ settings.rs          # settings.json 读写（原子写 + 语义归一 + 损坏备份）
 └─ commands.rs          # IPC 命令层（get_state / terminal_* / zoom_* / restart / stop / settings）
 
 ui/                     # 前端（Vite + 原生 TS + xterm.js），单页面
-└─ index.html / shell.ts # 主窗口 shell：iframe 内嵌 DSH UI + 启动遮罩（DeepSeek logo +
-                          # 内嵌只读 xterm 实时显示启动输出）+ 右下角终端小按钮
-                          # （点+终端，无地址）+ 终端面板（xterm）+ 设置弹窗
+└─ index.html / shell.ts # 主窗口 shell：iframe 内嵌 DSH UI（`allow` 委派剪贴板权限）+
+                          # 启动遮罩（DeepSeek logo + 内嵌 xterm 实时显示并可输入）+
+                          # 右下角终端小按钮 + 终端面板（xterm）+ 设置弹窗
 ```
 
 关键行为：
@@ -202,11 +226,13 @@ ui/                     # 前端（Vite + 原生 TS + xterm.js），单页面
 - **工作目录跟随**：`working_dir` 留空时，启动扫描 `~/.dsh/sessions/*/` 取最新会话
   的 workspace（projectKey 有损编码 → 分段合并枚举候选 + 目录存在性验证还原），
   作为 dsh web 的启动目录；手动设置后不覆盖。
-- **就绪判定**：端口 TCP 有监听即「直连」（不区分占用者）；启动路径以 HTTP 200 为准，
-  终端输出扫失败特征（`eaddrinuse` 等）快速失败；
+- **就绪判定**：端口 TCP 有监听即「直连」（不区分占用者；直连时若探测到 401 →
+  提示用户重启服务以完成认证）；启动路径以「HTTP 200 / 30x / 401」为就绪
+  （401 = 认证门存在，服务已就绪），并等认证 cookie 注入完成（宽限 ≤8s）后广播 Ready，
+  终端输出同时扫失败特征（`eaddrinuse` 等）快速失败；
 - **缩放**：WebView2 zoom factor 由 shell 页面按钮/Ctrl±0 触发（iframe 内快捷键
   不可注入，缩放按钮不受影响）；
-- **退出清理**：应用退出时 Job Object 句柄关闭 → cmd/npx/node 整树终止；
+- **退出清理**：应用退出时 Job Object 句柄关闭 → cmd/pnpm/node 整树终止；
   `keep_alive_on_exit` 时关闭会弹询问框（默认「保持运行」继续启动脱离进程，下次启动直连；
   「结束服务」则按端口杀 detached）；运行中也可用终端面板「⏹」手动停止——先杀当前会话树，
   端口仍被监听（detached/外部进程）时兜底 `netstat -ano` 找 PID → `taskkill /T /F`

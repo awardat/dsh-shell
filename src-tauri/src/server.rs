@@ -244,46 +244,44 @@ fn find_last_workspace() -> Option<PathBuf> {
 
 // ---------- HTTP 探测 ----------
 
-/// HTTP 层探测：服务是否已响应。
-/// dsh ≥ 0.1.2-rc.1 引入浏览器 token 认证后，无 token/cookie 的 `GET /` 返回 401
-/// （认证门存在 = 服务已就绪，UI 由带 token 的 URL 完成换 cookie 流程）；
-/// 旧版返回 200。因此 200 / 303 / 401 均视为"HTTP 服务活着"。
-fn http_responsive(port: u16) -> bool {
+/// HTTP 层探测：返回状态码（无法连接/无响应 → None）。
+fn http_status(port: u16) -> Option<u16> {
     let addr = format!("127.0.0.1:{port}");
-    let Ok(mut sock) = TcpStream::connect_timeout(
+    let mut sock = TcpStream::connect_timeout(
         &addr.parse().unwrap_or_else(|_| "127.0.0.1:1".parse().unwrap()),
         Duration::from_millis(800),
-    ) else {
-        return false;
-    };
+    )
+    .ok()?;
     let _ = sock.set_read_timeout(Some(Duration::from_millis(800)));
     let req = format!(
         "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
     );
-    if sock.write_all(req.as_bytes()).is_err() {
-        return false;
-    }
+    sock.write_all(req.as_bytes()).ok()?;
     let mut buf = [0u8; 128];
-    match sock.read(&mut buf) {
-        Ok(n) => {
-            let head = String::from_utf8_lossy(&buf[..n]);
-            head.starts_with("HTTP/1.1 200")
-                || head.starts_with("HTTP/1.0 200")
-                || head.starts_with("HTTP/1.1 30")
-                || head.starts_with("HTTP/1.0 30")
-                // dsh ≥ 0.1.2-rc.1：无 token/cookie 的根请求返回 401（认证门）
-                || head.starts_with("HTTP/1.1 401")
-                || head.starts_with("HTTP/1.0 401")
-        }
-        Err(_) => false,
-    }
+    let n = sock.read(&mut buf).ok()?;
+    let head = String::from_utf8_lossy(&buf[..n]);
+    // 形如 "HTTP/1.1 200 OK"
+    let mut parts = head.split_whitespace();
+    let _proto = parts.next()?;
+    parts.next()?.parse::<u16>().ok()
+}
+
+/// 服务是否已响应：dsh ≥ 0.1.2-rc.1 引入浏览器 token 认证后，无 token/cookie 的
+/// `GET /` 返回 401（认证门存在 = 服务已就绪，UI 由带 token 的 URL 完成换 cookie）；
+/// 旧版返回 200。因此 200 / 30x / 401 均视为"HTTP 服务活着"。
+fn http_responsive(port: u16) -> bool {
+    matches!(http_status(port), Some(200) | Some(401) | Some(302) | Some(303))
 }
 
 /// 从终端输出提取 dsh 打印的 Web URL（`dsh web: http://127.0.0.1:3080/?token=…`）。
 /// dsh ≥ 0.1.2-rc.1 打印带 launch token 的 URL，iframe 用它首访换取认证 cookie；
 /// 只认 loopback（127.0.0.1 / localhost），忽略 ` (LAN: …)` 等尾巴。
 fn extract_dsh_web_url(text: &str) -> Option<String> {
-    let needle = "dsh web:";
+    extract_url_after(text, "dsh web:")
+}
+
+/// 在 `needle` 之后提取第一个 loopback http URL（`extract_dsh_web_url` 的实现）。
+fn extract_url_after(text: &str, needle: &str) -> Option<String> {
     let mut from = 0;
     while let Some(rel) = text[from..].find(needle) {
         let start = from + rel + needle.len();
@@ -300,6 +298,155 @@ fn extract_dsh_web_url(text: &str) -> Option<String> {
             return Some(format!("http://{authority}"));
         }
         from = start;
+    }
+    None
+}
+
+/// 剥离 ANSI 转义序列（CSI / OSC / 两字符转义），保留普通文本。
+/// ConPTY 会在输出流中插入光标控制序列（如 `\x1b[11X`），若不剥离会把
+/// `dsh web: …?token=…` 的字面打断（甚至分片落在关键字中间）导致解析失败。
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            // CSI：参数字节 0x30–0x3F、中间字节 0x20–0x2F，最终字节 0x40–0x7E
+            Some('[') => {
+                for c2 in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c2) {
+                        break;
+                    }
+                }
+            }
+            // OSC：直到 BEL 或 ST（ESC \）
+            Some(']') => {
+                let mut prev_esc = false;
+                for c2 in chars.by_ref() {
+                    if c2 == '\u{7}' || (prev_esc && c2 == '\\') {
+                        break;
+                    }
+                    prev_esc = c2 == '\u{1b}';
+                }
+            }
+            // 其余两字符转义（如 ESC(0）整体丢弃；结尾孤立 ESC 也丢弃
+            Some(_) | None => {}
+        }
+    }
+    out
+}
+
+/// 从累计输出窗口提取 dsh web 认证 URL（三级回退，容忍 ConPTY 分片）：
+/// 1) 常规：剥离 ANSI 后按连续文本匹配（整行到达）；
+/// 2) 去换行后匹配（分片之间只插入了换行）；
+/// 3) 要素重组：从 `dsh web:` 之后分别取 loopback 端口与 token（分片之间被
+///    其他输出行插入、URL 已不连续时——实测 ConPTY 会把一行拆成多片并在中间
+///    投递子进程日志）。仅在 1)/2) 都拿不到**含 token 的** URL 时兜底。
+fn extract_dsh_web_url_loose(window: &str) -> Option<String> {
+    let plain = strip_ansi(window);
+    let with_token = |u: Option<String>| u.filter(|u| u.contains("token="));
+    if let Some(u) = with_token(extract_dsh_web_url(&plain)) {
+        return Some(u);
+    }
+    let joined: String = plain.lines().map(str::trim).collect::<Vec<_>>().join("");
+    if let Some(u) = with_token(extract_url_after(&joined, "dsh web:")) {
+        return Some(u);
+    }
+    let after = plain.split_once("dsh web:")?.1;
+    // 回退重组仅适用于 loopback 打印行，否则会把 LAN URL（`(LAN: http://192.168…）`）
+    // 误重组成本机地址
+    if !after.contains("127.0.0.1") && !after.contains("localhost") {
+        return None;
+    }
+    let port = extract_loopback_port(after)?;
+    let token = extract_token_value(after)?;
+    Some(format!("http://127.0.0.1:{port}/?token={token}"))
+}
+
+/// 取 loopback 端口，按可靠性递减：
+/// 1) `127.0.0.1:<port>` / `localhost:<port>`（连续形态）；
+/// 2) `<port>/?token=`（分片后端口与被拆出的 token 相邻）；
+/// 3) 首个 3–5 位数字串，**排除 IP 段**（前后不得为 `.`，避免把 `127.0.0.1` 的 `127` 当端口）。
+fn extract_loopback_port(s: &str) -> Option<u16> {
+    for prefix in ["127.0.0.1:", "localhost:"] {
+        if let Some(i) = s.find(prefix) {
+            let digits: String = s[i + prefix.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(p) = digits.parse::<u16>() {
+                if p > 0 {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    if let Some(ti) = s.find("?token=") {
+        let head = s[..ti].strip_suffix('/').unwrap_or(&s[..ti]);
+        let digits: String = head
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if let Ok(p) = digits.parse::<u16>() {
+            if p > 0 {
+                return Some(p);
+            }
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let digits = &s[start..i]; // ASCII 数字边界，切片安全
+            let prev = if start > 0 { &s[start - 1..start] } else { "" };
+            let next = if i < s.len() { &s[i..i + 1] } else { "" };
+            if prev != "." && next != "." && (3..=5).contains(&digits.len()) {
+                if let Ok(p) = digits.parse::<u16>() {
+                    if p > 0 {
+                        return Some(p);
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// 取 token 值：优先 `?token=` 形式，退化为任意 `token=`。
+fn extract_token_value(s: &str) -> Option<String> {
+    let read_value = |at: usize| -> Option<String> {
+        let v: String = s[at..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
+            .collect();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    };
+    if let Some(i) = s.find("?token=") {
+        if let Some(v) = read_value(i + "?token=".len()) {
+            return Some(v);
+        }
+    }
+    if let Some(i) = s.find("token=") {
+        if let Some(v) = read_value(i + "token=".len()) {
+            return Some(v);
+        }
     }
     None
 }
@@ -599,13 +746,26 @@ const DOWNLOAD_PATTERNS: &[&str] = &[
 
 pub fn boot(app: &AppHandle, inner: &Arc<Mutex<AppInner>>) {
     let settings = { inner.lock().unwrap().settings.clone() };
-    // 首次运行检测：系统无 dsh → npx 需下载（耗时可能数分钟到数十分钟）
-    let needs_download = !dsh_available();
     let port = settings.port;
     // 端口已被占用 → 直接连接（不区分占用者是否为 dsh 服务，
     // 也无需 HTTP 200：TCP 有监听即直连，避免误启动撞 EADDRINUSE）
     if port_listening(port) {
         eprintln!("[dsh-ui] port {port} occupied, connect directly");
+        // 直连模式没有终端输出可捕获 token；若服务要求浏览器认证（401），
+        // 壳内 cookie 缺失/失效时 iframe 会停在认证提示页 → 引导用户重启服务
+        // （重启由壳启动服务，即可捕获 token 并注入 cookie）
+        let auth_required = http_status(port) == Some(401);
+        if auth_required {
+            eprintln!("[dsh-ui] direct connect: service requires browser auth (401)");
+            if let Some(t) = inner.lock().unwrap().term.as_mut() {
+                let _ = t.write(
+                    format!(
+                        "echo [dsh-ui] 端口 {port} 的服务要求浏览器认证；请点工具栏「重新启动服务」以自动完成登录\r"
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
         // 仍提供终端会话（不喂启动命令），供查看/排查
         start_session(app, inner, false);
         if let Some(t) = inner.lock().unwrap().term.as_mut() {
@@ -618,10 +778,17 @@ pub fn boot(app: &AppHandle, inner: &Arc<Mutex<AppInner>>) {
                 eprintln!("[dsh-ui] write to session failed: {e}");
             }
         }
+        // 401 提示须在就绪后发出（前端在 ready 态展示提示条）
         set_phase(app, inner, Phase::Ready, None);
+        if auth_required {
+            let _ = app.emit("auth:required", serde_json::json!({}));
+        }
         start_keepalive(app, inner.clone());
         return;
     }
+    // 首次运行检测（仅启动路径需要）：系统无 dsh → npx/pnpm 需下载
+    // （耗时可能数分钟到数十分钟）。放在端口空闲分支内，直连时不白跑子进程与目录扫描
+    let needs_download = !dsh_available();
     eprintln!("[dsh-ui] port {port} free, starting session");
     if needs_download {
         // 放宽就绪超时：首次下载可能数分钟到数十分钟
@@ -727,9 +894,19 @@ fn start_session(app: &AppHandle, inner: &Arc<Mutex<AppInner>>, feed: bool) {
                 Ok(0) => break,
                 Ok(n) => {
                     let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = app2.emit("terminal:data", serde_json::json!({ "data": text }));
-                    // 追加到环形缓冲
-                    {
+                    // 先累积滑窗：token 行可能被 ConPTY 分片投递（跨读块），
+                    // 单块匹配会漏捕获 → 无 cookie → iframe 401
+                    if !failed_once {
+                        recent.push_str(&text);
+                        if recent.len() > 8192 {
+                            // 字节安全截断（多字节 UTF-8 不会 panic）
+                            recent = trim_window(&recent, 4096);
+                        }
+                    }
+                    // 代次校验：换代（重启/停止）后旧 reader 的残余输出不再污染新会话
+                    let same_gen = { inner2.lock().unwrap().gen == gen };
+                    if same_gen {
+                        let _ = app2.emit("terminal:data", serde_json::json!({ "data": text }));
                         let mut g = inner2.lock().unwrap();
                         g.term_buffer.push_str(&text);
                         truncate_term_buffer(&mut g.term_buffer);
@@ -738,12 +915,17 @@ fn start_session(app: &AppHandle, inner: &Arc<Mutex<AppInner>>, feed: bool) {
                     // Rust 侧换取签名 cookie 后注入 WebView2（iframe 跨站无法自持 Strict cookie）；
                     // probe 会等待 auth_done 之后才广播 ready，确保 iframe 首载即带 cookie
                     if !failed_once && !auth_exchange_started {
-                        if let Some(web_url) = extract_dsh_web_url(&text) {
+                        // 用累计窗口 + 归一化匹配：token 行可能被分片投递，
+                        // 且 ConPTY 会在片间插入 ANSI 控制序列/换行
+                        if let Some(web_url) = extract_dsh_web_url_loose(&recent) {
                             if web_url.contains("token=") {
                                 auth_exchange_started = true;
+                                // 单锁内校验代次后置位（与 auth_done 对称，勿污染新代）
                                 {
                                     let mut g = inner2.lock().unwrap();
-                                    g.auth_pending = true;
+                                    if g.gen == gen {
+                                        g.auth_pending = true;
+                                    }
                                 }
                                 let app3 = app2.clone();
                                 let gen_auth = gen;
@@ -791,25 +973,20 @@ fn start_session(app: &AppHandle, inner: &Arc<Mutex<AppInner>>, feed: bool) {
                     if failed_once {
                         continue;
                     }
-                    recent.push_str(&text);
-                    if recent.len() > 8192 {
-                        // 字节安全截断（多字节 UTF-8 不会 panic）
-                        recent = trim_window(&recent, 4096);
-                    }
                     let lower = recent.to_lowercase();
-                    // 下载/安装特征：pnpm/npm 大量拉取依赖 → 放宽就绪超时（首次安装慢）
-                    if !download_seen
-                        && DOWNLOAD_PATTERNS.iter().any(|p| lower.contains(*p))
-                        && inner2.lock().unwrap().gen == gen
-                    {
-                        download_seen = true;
+                    // 下载/安装特征：pnpm/npm 大量拉取依赖 → 放宽就绪超时（首次安装慢）。
+                    // 单锁内完成 gen 校验与三字段更新（避免两段锁之间的 TOCTOU）
+                    if !download_seen && DOWNLOAD_PATTERNS.iter().any(|p| lower.contains(*p)) {
                         let mut g = inner2.lock().unwrap();
-                        g.ready_timeout = 1800.max(g.ready_timeout);
-                        g.needs_download = true;
-                        eprintln!(
-                            "[dsh-ui] download in progress: ready timeout extended to {}s",
-                            g.ready_timeout
-                        );
+                        if g.gen == gen {
+                            download_seen = true;
+                            g.ready_timeout = 1800.max(g.ready_timeout);
+                            g.needs_download = true;
+                            eprintln!(
+                                "[dsh-ui] download in progress: ready timeout extended to {}s",
+                                g.ready_timeout
+                            );
+                        }
                     }
                     if let Some(p) = FAIL_PATTERNS.iter().find(|p| lower.contains(**p)) {
                         failed_once = true;
@@ -1129,7 +1306,11 @@ pub fn handle_close(app: &AppHandle) {
 }
 
 /// 关闭确认对话框：返回 true = 用户选择「保持运行」（默认按钮），false = 同时结束后台服务。
-/// blocking_show 内部在独立线程运行原生对话框（rfd async），主线程等待回调，无死锁风险。
+///
+/// 关于 `blocking_show` 不会死锁的依据（属依赖实现细节，升级 tauri-plugin-dialog 后需复核）：
+/// 插件内部把对话框派发到独立线程执行 rfd 的 `AsyncMessageDialog`，并通过 `sync_channel`
+/// 把结果回传；Windows 上原生模态对话框自带消息泵。主线程在等待期间仍可处理窗口消息，
+/// 因此阻塞等待不会与 WebView/事件循环互相等待。本机退出流程实测可用（两按钮语义正确）。
 fn ask_keep_alive(app: &AppHandle) -> bool {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     app.dialog()
@@ -1221,6 +1402,56 @@ mod tests {
             extract_dsh_web_url(line).as_deref(),
             Some("http://127.0.0.1:3080/?token=KDEY0TIaKfL0nJ88")
         );
+    }
+
+    #[test]
+    fn strip_ansi_removes_control_sequences() {
+        assert_eq!(strip_ansi("a\u{1b}[11Xb"), "ab");
+        assert_eq!(strip_ansi("a\u{1b}[K b"), "a b");
+        assert_eq!(strip_ansi("a\u{1b}]0;title\u{7}b"), "ab");
+        assert_eq!(strip_ansi("a\u{1b}]0;title\u{1b}\\b"), "ab");
+        assert_eq!(strip_ansi("plain"), "plain");
+        // 多字节内容不受影响
+        assert_eq!(strip_ansi("中文\u{1b}[2J输出"), "中文输出");
+    }
+
+    #[test]
+    fn extracts_dsh_web_url_across_chunks_and_ansi() {
+        // 模拟真实故障（ConPTY 取证形态）：token 行被拆成三片，中间插入子进程日志行
+        let window = "C:\\>node app.js\r\ndsh web: http://127.0.0.1:\u{1b}[15X\
+svc listening on 3999 (token=SPLIT123)\r\n3999/?token=SPLIT123\r\n";
+        assert_eq!(
+            extract_dsh_web_url_loose(window).as_deref(),
+            Some("http://127.0.0.1:3999/?token=SPLIT123")
+        );
+        // 中间插入控制序列、只有换行分隔
+        let window2 = "dsh web: http://127.0.0.1:3999/?to\u{1b}[11Xken=ABC\u{1b}[K\r\n";
+        assert_eq!(
+            extract_dsh_web_url_loose(window2).as_deref(),
+            Some("http://127.0.0.1:3999/?token=ABC")
+        );
+        // 片间插入了换行（URL 本体仍连续）
+        let window3 = "dsh web: http://127.0.0.1:3999/?tok\r\nen=XYZ\r\n";
+        assert_eq!(
+            extract_dsh_web_url_loose(window3).as_deref(),
+            Some("http://127.0.0.1:3999/?token=XYZ")
+        );
+        // 常规整行（含 LAN 尾巴）
+        let window4 =
+            "dsh web: http://127.0.0.1:3080/?token=KDEY (LAN: http://192.168.1.5:3080/?token=Q)";
+        assert_eq!(
+            extract_dsh_web_url_loose(window4).as_deref(),
+            Some("http://127.0.0.1:3080/?token=KDEY")
+        );
+        // 非 loopback / 无 token / 无该行 → None
+        assert_eq!(extract_dsh_web_url_loose("dsh web: http://192.168.1.5:3080/"), None);
+        assert_eq!(
+            extract_dsh_web_url_loose("dsh web: http://192.168.1.5:3080/?token=LANONLY"),
+            None,
+            "LAN-only 行不得被重组成本机地址"
+        );
+        assert_eq!(extract_dsh_web_url_loose("dsh web: http://127.0.0.1:3080/"), None);
+        assert_eq!(extract_dsh_web_url_loose("普通日志输出"), None);
     }
 
     #[test]

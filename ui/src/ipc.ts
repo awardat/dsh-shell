@@ -80,3 +80,6 @@ export const onDownloadCompleted = (cb: (p: { path: string; ok: boolean }) => vo
 
 export const onKeepAliveFailed = (cb: (p: { error: string }) => void) =>
   listen<{ error: string }>("keepalive:failed", (e) => cb(e.payload));
+
+/** 直连场景：服务要求浏览器认证（壳未持有 token/cookie），需引导用户重启服务完成登录 */
+export const onAuthRequired = (cb: () => void) => listen("auth:required", () => cb());

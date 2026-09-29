@@ -10,6 +10,9 @@ pub struct TerminalSession {
     pub master: Box<dyn MasterPty + Send>,
     pub writer: Box<dyn Write + Send>,
     pub child: Box<dyn Child + Send + Sync>,
+    /// 作业对象：**持有即生效**——句柄在 Drop 时关闭，KILL_ON_JOB_CLOSE 随即将整棵
+    /// 进程树终止。字段从不被读取（无 #[allow] 会报 never read），但绝不能删。
+    #[allow(dead_code)]
     pub job: Option<JobObject>,
 }
 

@@ -74,10 +74,10 @@ pub fn run() {
             // 窗口底色与启动画面一致（深色）：页面首帧渲染前不显示白屏
             .background_color(tauri::window::Color(13, 17, 23, 255));
             // 调试：DSH_DEBUG_DEVTOOLS 值为 1/true 才启用（release 误继承环境变量不再裸奔）
+            // 注意：additional_browser_args 是覆盖语义——所有参数必须一次合并传入
             let dbg = std::env::var("DSH_DEBUG_DEVTOOLS").unwrap_or_default();
             let debug_enabled = dbg == "1" || dbg.eq_ignore_ascii_case("true");
             if debug_enabled {
-                // WebView2 环境参数以首个 webview 为准
                 main_builder = main_builder.additional_browser_args("--remote-debugging-port=9222");
             }
             let main = main_builder

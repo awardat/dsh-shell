@@ -73,7 +73,13 @@ pub fn step(app: &AppHandle, delta: i8) -> Result<f64, String> {
             serde_json::to_string_pretty(&g.settings).unwrap_or_default(),
         )
     };
-    main.set_zoom(factor).map_err(|e| e.to_string())?;
+    if let Err(e) = main.set_zoom(factor) {
+        // 应用失败：内存态已在锁内更新（等于下发的值），须回滚，避免内存/窗口不一致
+        let mut g = inner.lock().unwrap();
+        g.zoom = old_zoom;
+        g.settings.zoom = old_settings;
+        return Err(e.to_string());
+    }
     if let Err(e) = crate::settings::write_settings(&dir, &text) {
         {
             let mut g = inner.lock().unwrap();

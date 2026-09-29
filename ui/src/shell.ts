@@ -9,6 +9,7 @@ import {
   onDownloadStarting,
   onDownloadCompleted,
   onKeepAliveFailed,
+  onAuthRequired,
   DEFAULT_SETTINGS,
   type Settings,
 } from "./ipc";
@@ -106,6 +107,9 @@ function fitBootTerm() {
 // ---------- 状态 ----------
 let url = "http://127.0.0.1:3080/";
 let loaded = false;
+// 上一次相位：用于识别"进入 ready"的转换（每次都（重新）加载 iframe），
+// 而不是依赖 URL 变化——改端口保存时 URL 已变但服务未起，按 URL 比较会提前导航到空端口
+let lastPhase: string | null = null;
 // 启动 watchdog：轮询 getState 连续失败（IPC 层不可用）时给出可操作错误
 let ipcFailures = 0;
 const IPC_FAIL_LIMIT = 3;
@@ -116,6 +120,12 @@ function showIpcError() {
   browserBtn.hidden = true;
   phaseText.textContent = "界面通信失败";
   errorText.textContent = "无法与主进程通信。请关闭窗口后重新打开应用。";
+  // IPC 已不可用：重试按钮只会产生控制台 rejection，禁用并说明
+  const retry = document.getElementById("btn-retry") as HTMLButtonElement | null;
+  if (retry) {
+    retry.disabled = true;
+    retry.title = "主进程通信已中断";
+  }
 }
 
 function applyState(p: { phase: string; message?: string; url: string; zoom: number }) {
@@ -136,19 +146,17 @@ function applyState(p: { phase: string; message?: string; url: string; zoom: num
     stateChip.classList.add("ok");
     bootMask.hidden = true;
     floatBtn.hidden = false;
-    // 首次就绪加载 DSH UI；URL 变化（如改端口后重启）时重新加载 iframe。
-    // frame.src 可能带认证重载的缓存破拆参数（?_=…），按去参后的主 URL 比较
-    const norm = (u: string) => {
-      try {
-        const x = new URL(u);
-        x.search = "";
-        x.hash = "";
-        return x.href;
-      } catch {
-        return u;
-      }
-    };
-    if (!loaded || norm(frame.src) !== norm(p.url)) {
+    // IPC 恢复可用：解除 watchdog 的禁用
+    const retry = document.getElementById("btn-retry") as HTMLButtonElement | null;
+    if (retry) {
+      retry.disabled = false;
+      retry.title = "重新启动服务";
+    }
+    // 进入 ready（首次启动 / 重启后就绪 / 从失败恢复）一律加载或重载 iframe：
+    // 覆盖"改端口保存时提前导航到空端口留下的错误页"这类无法自愈的状态。
+    // 运行中（ready→ready）仅 URL 变化不在此导航——服务尚未就绪，交给下一次相位转换。
+    const enteredReady = lastPhase !== "ready";
+    if (!loaded || enteredReady) {
       loaded = true;
       frame.src = p.url;
     }
@@ -183,6 +191,7 @@ function applyState(p: { phase: string; message?: string; url: string; zoom: num
     phaseText.textContent = p.message || "正在启动服务…";
     fitBootTerm();
   }
+  lastPhase = p.phase;
 }
 
 async function refreshState() {
@@ -235,13 +244,43 @@ void (async () => {
   live = true;
 })();
 
+const LOG_MAX_LINES = 200;
+
 function log(msg: string) {
   const line = document.createElement("div");
   line.className = "log-line";
   line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
   logEl.appendChild(line);
+  // 长会话下日志 DOM 不无限增长：超出上限丢弃最旧行
+  while (logEl.childElementCount > LOG_MAX_LINES) {
+    logEl.firstElementChild?.remove();
+  }
   logEl.scrollTop = logEl.scrollHeight;
 }
+
+// ---------- 直连场景：服务要求浏览器认证（无 token 可捕获） ----------
+let bannerTimer: number | undefined;
+function showBanner(text: string) {
+  let banner = document.getElementById("auth-banner");
+  if (!banner) {
+    banner = document.createElement("div");
+    banner.id = "auth-banner";
+    banner.className = "banner";
+    document.body.appendChild(banner);
+  }
+  banner.textContent = text;
+  banner.hidden = false;
+  if (bannerTimer !== undefined) window.clearTimeout(bannerTimer);
+  bannerTimer = window.setTimeout(() => {
+    banner!.hidden = true;
+  }, 8000);
+}
+
+void onAuthRequired(() => {
+  const text = "服务需要浏览器认证：请点终端面板「⟳ 重新启动服务」完成登录";
+  log(text);
+  showBanner(text);
+});
 
 void onTerminalExit((p) => {
   log(`终端进程已退出${p.code !== undefined ? `（退出码 ${p.code}）` : ""}`);
